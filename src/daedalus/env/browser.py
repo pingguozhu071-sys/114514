@@ -165,39 +165,79 @@ def _chromium_exe(root: pathlib.Path, revision: str) -> pathlib.Path:
     return d / "chrome-linux" / "chrome"
 
 
+def _driver_version(pkg_dir: pathlib.Path) -> str:
+    """读 driver 的 `package.json` 版本（读不到返回空串，**不猜**）。"""
+    try:
+        import json
+        meta = pkg_dir / "driver" / "package" / "package.json"
+        if meta.exists():
+            return str(json.loads(meta.read_text(encoding="utf-8")).get("version") or "")
+    except Exception:
+        pass
+    return ""
+
+
 def _playwright_is_genuine() -> tuple[bool, str]:
     """自证"我们用的浏览器自动化是**未改装**的正版 playwright"。
 
     为什么要有这一条：本工程的边界是"未改装的浏览器"（`docs/07`）。而生态里存在
-    **反检测改装的 playwright 分支**（例如 patchright 就是同 API 的 fork），它们可能被装成
-    同名/近名包；一旦 `import playwright` 被换成分支，浏览器就不再是"未改装"了——而这个变化
-    **完全静默**（代码一行没改，行为却变了）。所以这里在运行时就地核对：
+    **反检测改装的 playwright 分支**（patchright/rebrowser/undetected 等同 API fork），
+    一旦被换进来，浏览器就不再"未改装"——而这个变化**完全静默**（代码一行没改）。
 
-      * 模块路径里出现 `patchright`（或其它已知分支名）→ 判为**不合规**；
-      * 发行包名不是 `playwright`（`importlib.metadata`）→ 同样判为不合规。
-
-    结论只影响**报告与拒绝启用**（`probe_browser` 会如实说不合规原因），不尝试"修正"环境
-    ——换包是用户的事，我们只负责不假装没看见。
+    三重核对（后两重是**重新打包时发现的混装漏洞**补的）：
+      ① 模块路径里出现分支名 → 不合规；
+      ② 发行包名不是 `playwright` → 不合规；
+      ③ **driver 版本必须与 Python 包版本一致** —— 抓"正版 Python + 改装 driver"的
+         **混装**：patchright 会装一个名叫 `hook-playwright.sync_api.py` 的 PyInstaller 钩子
+         （内容却是 `collect_data_files("patchright")`），于是打包时给 `playwright.sync_api`
+         收的是**改装分支的 node 驱动**（实测：Python 侧 1.62.0、驱动侧 1.61.1）。
+         模块名仍然是 `playwright`，前两重核对都看不出来——只有版本对不上会露出来。
     """
     try:
         import playwright as _pw
-        path = str(pathlib.Path(getattr(_pw, "__file__", "")).parent).lower()
+        mod_dir = pathlib.Path(getattr(_pw, "__file__", "")).parent
+        path = str(mod_dir).lower()
     except Exception as e:
         return False, f"取不到 playwright 路径（{type(e).__name__}: {e}）"
-    known_forks = ("patchright", "rebrowser", "undetected", "playwright_stealth")  # noqa: lint -- 这是检测词表，不是能力
+    known_forks = ("patchright", "rebrowser", "undetected", "playwright_stealth")  # noqa: lint -- 检测词表
     for fork in known_forks:
         if fork in path:
             return False, (f"检测到改装分支 `{fork}`（路径 {path}）——本工程只允许**未改装**的 "
                            f"playwright；相关能力已禁用")
+    py_ver = ""
     try:
         import importlib.metadata as _md
         dist = _md.distribution("playwright")
         name = str(getattr(dist, "metadata", {}).get("Name", "") or "").lower()
         if name and name != "playwright":
             return False, f"playwright 这个发行包实际叫 `{name}`（疑似分支）——按未改装要求禁用"
+        py_ver = str(dist.version or "")
     except Exception:
-        pass                       # 元数据读不到不阻塞（路径检查已经够了）
+        pass
+    drv_ver = _driver_version(mod_dir)
+    if py_ver and drv_ver and py_ver != drv_ver:
+        return False, (f"**驱动与 Python 包版本不一致**（Python {py_ver} / driver {drv_ver}）——"
+                       f"这是装配混装的典型症状（正版 Python 配了改装分支配的驱动），按未改装要求禁用")
     return True, ""
+
+
+def _browsers_root_scan(engine: str) -> tuple[str, str]:
+    """退路：不看 `browsers.json`，直接扫浏览器根目录找可执行文件。
+
+    为什么要有这条：**打包后** `browsers.json` 可能不在预期位置（它属于驱动数据）。
+    此时若直接判"浏览器不可用"，就会出现"本机明明装了 chromium 却说没有"的假缺件。
+    宁可如实说"没找到版本清单，用了已装的 chromium-<rev>"，也不要谎报缺件。
+    """
+    root = _browsers_root(os.environ.get("PLAYWRIGHT_BROWSERS_PATH"))
+    if not root.exists():
+        return "", f"浏览器根目录不存在：{root}"
+    for c in sorted(root.glob(f"{engine}-*"), reverse=True):
+        cand = c / ("chrome-win64/chrome.exe" if sys.platform.startswith("win")
+                    else ("chrome-linux/chrome" if sys.platform != "darwin"
+                          else "chrome-mac/Chromium.app/Contents/MacOS/Chromium"))
+        if cand.exists():
+            return str(cand), f"未找到 browsers.json，改用已装的 {c.name}"
+    return "", f"{root} 下没有可用的 {engine} 目录"
 
 
 def probe_browser(engine: str = "chromium") -> BrowserCapability:
@@ -258,6 +298,15 @@ def probe_browser(engine: str = "chromium") -> BrowserCapability:
         why = (why + "；" if why else "") + \
             f"浏览器二进制不存在于 {root}（用 `python -m playwright install {engine}` 安装；" \
             f"本工程**不静默安装**）"
+    else:
+        # **没有 browsers.json**（打包态的常见情形：它属于驱动数据）→
+        # 退一步扫已装的浏览器，而不是谎报"缺件"（实测：打包后本机装了 chromium 却报不可用）
+        exe, note = _browsers_root_scan(engine)
+        if exe:
+            return BrowserCapability(playwright=True, engine=engine, executable=exe,
+                                     executable_exists=True, version=engine,
+                                     reason=note)
+        why = (why + "；" if why else "") + note
     return BrowserCapability(playwright=True, engine=engine, executable=exe,
                              executable_exists=False, version=ver, reason=why)
 

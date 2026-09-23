@@ -360,6 +360,45 @@ def t_docs_present():
     return ok(f"10 份齐备，共 {total // 1024} KB")
 
 
+@case("F4 **反改装分支**：打包不收集 patchright 等反检测 fork，且产物核对会硬拦")
+def t_no_fork_in_package():
+    """重新打包时发现的真问题（最值钱的一条）：
+
+    `patchright` 装了一个**名叫 `hook-playwright.sync_api.py` 的 PyInstaller 钩子**，
+    内容却是 `collect_data_files("patchright")` —— 于是打包时给 `playwright.sync_api`
+    收的是**改装分支的 node 驱动**：Python 侧是正版 1.62.0，驱动侧却是 patchright 1.61.1。
+    结果是「**未改装的浏览器**」这条承诺在打包后**静默失效**，而运行期路径检查看不出来
+    （模块名仍然是 `playwright`）。
+
+    两头都钉住：① spec 里排除分支 + 显式收正版驱动；② 产物核对硬断言（缺正版驱动或
+    出现分支目录都判失败）。
+    """
+    spec_text = (ROOT / "packaging" / "daedalus.spec").read_text(encoding="utf-8")
+    for fork in ("patchright", "rebrowser", "undetected_playwright"):
+        assert fork in spec_text.split("FORBIDDEN")[0] or fork in spec_text, f"spec 未排除 {fork}"
+    assert "collect_data_files(\"playwright\")" in spec_text, "spec 没有显式收正版 playwright 驱动"
+    # 产物核对逻辑：造一个"带分支目录"的假产物 → 必须判失败
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("build_fork", str(ROOT / "tools" / "build.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    fake = _TMP / "fork_dist" / "daedalus"
+    (fake / "_internal" / "patchright").mkdir(parents=True, exist_ok=True)
+    (fake / "daedalus.exe").write_bytes(b"x")
+    (fake / "daedalus-cli.exe").write_bytes(b"x")
+    real_dist = mod.DIST
+    try:
+        mod.DIST = fake.parent
+        rep = mod.verify_package(expect_setup=False)
+        joined = " ".join(rep["lines"])
+        assert rep["ok"] is False, rep["lines"]
+        assert "改装分支" in joined, rep["lines"]
+        assert "正版 playwright 驱动" in joined and "✗" in joined, rep["lines"]
+    finally:
+        mod.DIST = real_dist
+    return ok("spec 排除分支并显式收正版驱动；产物核对会把「带分支目录」判失败")
+
+
 @case("F3 边界：安装器与打包脚本无对抗性词汇、无第二出网路径")
 def t_packaging_boundary():
     banned = ("stealth", "webdriver", "指纹伪装", "打码", "captcha", "proxy_rotat", "humaniz")  # noqa: lint -- 扫描器词表
@@ -369,12 +408,15 @@ def t_packaging_boundary():
               ROOT / "tools" / "build.py", ROOT / "packaging" / "make_installer_art.py"]:
         text = p.read_text(encoding="utf-8", errors="replace")
         code = "\n".join(ln for ln in text.splitlines()
-                         if not ln.strip().startswith((";", "#")))
+                         if not ln.strip().startswith((";", "#"))
+                         # 行内豁免：**检测词表**要能写出被禁的词（否则没法排除它们）。
+                         # 这与 `tools/lint.py` 的 `# noqa: lint` 同一套机制，且必须写理由。
+                         and "noqa: lint" not in ln)
         for k in banned + net:
             if k.lower() in code.lower():
                 bad.append(f"{p.name}:{k}")
     assert not bad, f"打包面出现不该有的关键词：{bad}"
-    return ok("安装器/打包脚本：零对抗词汇、零裸网络调用")
+    return ok("安装器/打包脚本：零对抗词汇、零裸网络调用（检测词表已显式豁免）")
 
 
 # ══════════════════════════════════════════════════════════════════

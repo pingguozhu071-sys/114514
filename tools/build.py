@@ -41,6 +41,14 @@ NSIS_CANDIDATES = (
 )
 
 REQUIRED_IN_BUNDLE = ("daedalus.exe", "daedalus-cli.exe", "_internal")
+# 打包面**必须有**的东西：正版 playwright 的驱动数据（浏览器环境靠它起驱动进程）。
+# 踩过的坑：patchright 的 PyInstaller 钩子会冒充 `playwright.sync_api` 的 hook，
+# 把**改装分支**的驱动收进包 → 必须显式收集 + 在这里硬断言。
+REQUIRED_PLAYWRIGHT_DRIVER = "_internal/playwright/driver/package/browsers.json"
+# 打包面**绝不该有**的东西：反检测改装分支（本工程边界不允许，且会静默改变浏览器行为）
+FORBIDDEN_BUNDLE_DIRS = ("_internal/patchright", "_internal/rebrowser",  # noqa: lint -- 检测词表
+                         "_internal/undetected_playwright",
+                         "_internal/playwright_stealth")  # noqa: lint -- 检测词表
 # 解包核对：这些**绝不该**出现在产物里（凭据/密钥/敏感配置）
 FORBIDDEN_PATTERNS = (
     "cookies.txt", "cookies.json", "secret", "master.key", ".bin",
@@ -185,7 +193,7 @@ def build(*, dry: bool = False, exe_only: bool = False, skip_art: bool = False) 
 
 
 def verify_package(*, expect_setup: bool = True) -> dict:
-    """核对产物：必需的都在、禁止的都不在（解包核对）。"""
+    """核对产物：必需的都在、禁止的都不在（**含浏览器驱动的来源核对**）。"""
     lines: list[str] = []
     ok = True
     bundle = DIST / "daedalus"
@@ -196,6 +204,17 @@ def verify_package(*, expect_setup: bool = True) -> dict:
         good = p.exists()
         ok = ok and good
         lines.append(f"{'✓' if good else '✗'} {name}")
+    # 浏览器驱动的来源（硬断言）：正版必须有；改装分支绝不许有
+    drv = bundle / REQUIRED_PLAYWRIGHT_DRIVER
+    good = drv.exists()
+    ok = ok and good
+    lines.append(f"{'✓' if good else '✗'} 正版 playwright 驱动（{REQUIRED_PLAYWRIGHT_DRIVER}）")
+    forks = [d for d in FORBIDDEN_BUNDLE_DIRS if (bundle / d).exists()]
+    if forks:
+        ok = False
+        lines.append(f"✗ 包里出现**反检测改装分支**（本工程边界不允许）：{forks}")
+    else:
+        lines.append("✓ 包内无反检测改装分支（patchright/rebrowser/undetected…）")
     setup = sorted(DIST.glob("Daedalus-Setup-*.exe"))
     if expect_setup:
         good = bool(setup)

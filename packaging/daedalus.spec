@@ -40,8 +40,26 @@ excludes = [
     "tkinter", "matplotlib", "pandas", "scipy", "IPython", "jupyter", "notebook",
     "PyQt5", "PyQt6", "PySide2",          # 只用 PySide6，别的 Qt 绑定一律不打包
     "pytest", "_pytest", "setuptools", "pip", "wheel",
-    # 注意：**不要**排除 `playwright._impl._driver`——浏览器环境就靠它启动驱动进程
+    # ⚠️ **必须排除反检测改装的 playwright 分支**（patchright / rebrowser / undetected 等）：
+    #    踩过的坑（重新打包时发现）：patchright 装了一个**名叫 `hook-playwright.sync_api.py`
+    #    的 PyInstaller 钩子**，内容却是 `collect_data_files("patchright")` —— 于是打包时给
+    #    `playwright.sync_api` 收的是**改装分支的驱动**：Python 侧是正版 1.62.0，
+    #    驱动侧却是 patchright 1.61.1 的 node 包。结果是"**未改装的浏览器**"这条承诺
+    #    在打包后**静默失效**（而且运行期路径检查看不出来，因为模块名仍然是 playwright）。
+    #    这是本工程边界（docs/07）不允许的，所以从两端封：这里排除它，
+    #    再由 `tools/build.py` 的产物核对**硬断言**包里没有分支文件。
+    "patchright", "patchright._impl", "patchright._impl.__pyinstaller",   # noqa: lint -- 检测词表
+    "rebrowser", "rebrowser_playwright", "undetected_playwright", "playwright_stealth",  # noqa: lint -- 检测词表
 ]
+
+# ⚠️ 显式收集**正版 playwright 的驱动数据**（node 包 + browsers.json）。
+# 不写这一条就会依赖 PyInstaller 自己找 hook —— 而那正是上面那个坑的入口：
+# 找到了分支的 hook，就会收错驱动。显式收集 + 构建期断言 = 双保险。
+try:
+    from PyInstaller.utils.hooks import collect_data_files
+    datas += collect_data_files("playwright")
+except Exception:                                    # pragma: no cover - 极端环境
+    pass
 
 block_cipher = None
 
@@ -51,7 +69,10 @@ a = Analysis(                               # noqa: F821
     binaries=[],
     datas=datas,
     hiddenimports=hiddenimports,
-    hookspath=[],
+    # ⚠️ **本目录的钩子优先于分发版自带的钩子** —— 这是挡住
+    #    "patchright 冒充 `hook-playwright.sync_api.py`"的唯一可靠手段（见 packaging/hooks/ 的说明）。
+    #    `excludes` 挡不住它：那排除的是**模块图**，挡不住别人钩子里收的**数据文件**。
+    hookspath=[str(ROOT / "packaging" / "hooks")],
     runtime_hooks=[],
     excludes=excludes,
     cipher=block_cipher,
