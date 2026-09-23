@@ -369,6 +369,40 @@ def t_observed_shape():
     return ok(f"字段齐全：{sorted(d)}")
 
 
+@case("D4 槽位**强制**（不是记账）：满了就明确拒绝，不排队、不偷偷超开")
+def t_slot_enforced():
+    """安全自审发现的真问题：槽位原来只是计数器，并发 `observe()` 能无限开上下文。
+
+    修法：`BoundedSemaphore` + 非阻塞获取。语义与"缺省即拒绝"一致——
+    **拿不到就明确拒绝**，不排队（排队会把"容量不足"藏起来，让上层以为一切正常而实际在堆积）。
+    """
+    from daedalus.env.browser import BrowserEnvironment
+    env = BrowserEnvironment(gate=lambda u: False, robots=None, max_contexts=1, max_pages=1)
+    assert env._ctx_slots is not None and env._page_slots is not None, "没有槽位信号量"
+    # 占满槽位（模拟一个正在跑着的 observe）
+    assert env._ctx_slots.acquire(blocking=False) and env._page_slots.acquire(blocking=False)
+    try:
+        v = env.observe("https://example.com/")
+        assert v.ok is False and "槽位已满" in v.reason, v.to_dict()
+        assert "不排队" in v.reason, v.reason
+        assert env._pw is None and env._browser is None, "满槽时竟然启动了浏览器"
+    finally:
+        env._ctx_slots.release()
+        env._page_slots.release()
+    # 归还后仍可用（不误伤正常路径）
+    cap = env.capability()
+    assert cap["enabled"] is True, cap
+    # 只读一页也用不了时不该死锁：页槽满 → 归还上下文槽（不泄漏）
+    env2 = BrowserEnvironment(gate=lambda u: False, robots=None, max_contexts=2, max_pages=1)
+    assert env2._page_slots.acquire(blocking=False)
+    v2 = env2.observe("https://example.com/")
+    assert v2.ok is False and "页槽位已满" in v2.reason, v2.to_dict()
+    assert env2._ctx_slots.acquire(blocking=False), "页槽失败时上下文槽没还回来（槽位泄漏）"
+    env2._ctx_slots.release()
+    env2._page_slots.release()
+    return ok("满槽 → 明确拒绝且零启动；页槽失败会归还上下文槽；归还后仍可用")
+
+
 @case("E1 闭环接线：空壳页 → 路由到浏览器阶段 → 真跑并落证据（假环境，离线可判）")
 def t_runner_browser_stage():
     from _harness import build_offline_stack

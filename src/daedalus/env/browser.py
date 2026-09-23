@@ -351,6 +351,13 @@ class BrowserEnvironment:
         self._lock = threading.Lock()
         self._ctx_used = 0
         self._page_used = 0
+        # **槽位强制**（安全自审发现的真问题：原来只有计数、没有约束——并发 observe 能无限
+        # 开上下文，等于"声明了槽位但没人管"）。语义是**缺省即拒绝**：拿不到槽位**不排队**，
+        # 直接明确拒绝——排队会把"容量不足"藏起来，让上层以为一切正常而实际在堆积。
+        self._ctx_slots = (threading.BoundedSemaphore(self.max_contexts)
+                           if self.max_contexts > 0 else None)
+        self._page_slots = (threading.BoundedSemaphore(self.max_pages)
+                            if self.max_pages > 0 else None)
         self._calls = 0
         self._opened = 0
         self._closed = 0
@@ -443,7 +450,26 @@ class BrowserEnvironment:
         observed: list[ObservedRequest] = []
         denied: list[dict] = []
         captured = {"bytes": 0, "sha256": "", "size": 0}
-        allow_hosts: set[str] = set()
+
+        # **先要槽位**（非阻塞）：拿不到就明确拒绝，**不排队**（见 __init__ 的说明）。
+        # 顺序：上下文槽 → 页槽；任何一个失败都要把已拿到的还回去。
+        got_ctx = got_page = False
+        if self._ctx_slots is not None:
+            got_ctx = self._ctx_slots.acquire(blocking=False)
+            if not got_ctx:
+                METRICS.inc("browser.slot_denied")
+                return BrowserVerdict(False, f"浏览器上下文槽位已满"
+                                             f"（{self.max_contexts} 个都在用）——缺省即拒绝，不排队",
+                                      seconds=time.monotonic() - t0)
+        if self._page_slots is not None:
+            got_page = self._page_slots.acquire(blocking=False)
+            if not got_page:
+                if got_ctx and self._ctx_slots is not None:
+                    self._ctx_slots.release()
+                METRICS.inc("browser.slot_denied")
+                return BrowserVerdict(False, f"浏览器页槽位已满"
+                                             f"（{self.max_pages} 个都在用）——缺省即拒绝，不排队",
+                                      seconds=time.monotonic() - t0)
 
         with self._lock:
             self._ctx_used += 1
@@ -575,6 +601,17 @@ class BrowserEnvironment:
                                   observed=list(observed), denied=list(denied),
                                   seconds=time.monotonic() - t0)
         finally:
+            # 还槽位（顺序与获取相反）；`BoundedSemaphore.release()` 超量会抛，所以按标志位还
+            if got_page and self._page_slots is not None:
+                try:
+                    self._page_slots.release()
+                except Exception:
+                    pass
+            if got_ctx and self._ctx_slots is not None:
+                try:
+                    self._ctx_slots.release()
+                except Exception:
+                    pass
             with self._lock:
                 self._ctx_used = max(0, self._ctx_used - 1)
                 self._page_used = max(0, self._page_used - 1)
