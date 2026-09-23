@@ -378,6 +378,31 @@ class EngineApp:
         except Exception as e:
             problems.append(f"资源计划不自洽：{e}")
         pol = self.policy.summary() if hasattr(self.policy, "summary") else {}
+        # 界面语言（**装完语言对不对**这件事要能自己在目标机器上查）：
+        # 顺序 设置 > 安装器选择（exe 同级 install.marker 的 lang=）> 系统 UI 语言 > en-US
+        try:
+            from daedalus.ui.i18n import (detect_system_locale, read_installer_locale,
+                                          resolve_locale)
+            inst = ""
+            try:
+                from daedalus.ui.settings import SettingsStore
+                inst = str(SettingsStore(self.data_root, autosave=False).get("locale") or "")
+            except Exception:
+                inst = ""
+            ui_locale = resolve_locale(inst)
+            if inst in ("zh-CN", "ja-JP", "en-US"):
+                src_of = "用户设置"
+            elif read_installer_locale():
+                src_of = "安装器选择"
+            elif detect_system_locale() == ui_locale:
+                src_of = "系统 UI 语言"
+            else:
+                src_of = "兜底"
+            ui_info = {"locale": ui_locale, "source": src_of, "setting": inst or "跟随系统",
+                       "installer": read_installer_locale() or "（无标记）",
+                       "system": detect_system_locale()}
+        except Exception as e:
+            ui_info = {"locale": "en-US", "source": f"探测失败：{type(e).__name__}: {e}"}
         out = {
             "about": about(),
             "paths": {"data_root": str(self.data_root), "db": str(self.db.path),
@@ -393,6 +418,7 @@ class EngineApp:
             "secrets": {"dpapi": dpapi_available()},
             "net": {"dns_cache": cache_stats()},
             "metrics": METRICS.summary(),
+            "ui": ui_info,                 # 界面语言与来源（装完在目标机上可查）
             "problems": problems,
             "warnings": warnings,
         }

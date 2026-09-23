@@ -140,10 +140,13 @@ class SignatureLabel:
     """右下角签名（可关；颜色随强调色；Show/Resize/Activate 时 raise）。"""
 
     @staticmethod
-    def make(tokens, parent, *, text: str = "", locale: str = "zh-CN"):
+    def make(tokens, parent, *, text: str = "", locale: str = ""):
         _, _, QLabel, _, _, _ = _qt()
         from daedalus import display_name, VERSION
-        label = QLabel(text or f"{display_name(locale)} v{VERSION}", parent)
+        from daedalus.ui.i18n import translator
+        loc = locale or getattr(tokens, "locale", "") or "en-US"
+        t = translator(loc)
+        label = QLabel(text or t("app.signature", name=display_name(loc), version=VERSION), parent)
         label.setObjectName("signature")
         label.setStyleSheet(f"color: {tokens.accent}; background: transparent;"
                             f" font-size: {max(9, int(tokens.font_pt) - 1)}pt;")
@@ -255,15 +258,14 @@ class TitleBar:
 def apply_theme(app_or_window, tokens) -> dict:
     """把一组令牌**一次性**应用到整棵树（所有卡片都由这一个函数生成样式）。
 
-    返回本次应用的事实（给调试/GUI 显示"当前生效参数"）：透明度、描边、圆角、强调色。
+    返回本次应用的事实（给调试/GUI 显示"当前生效参数"）：透明度、描边、圆角、强调色、字体链。
     """
-    from daedalus.ui.theme import card_qss, panel_qss
+    from daedalus.ui.theme import card_qss, font_qss, panel_qss
     st = _status(tokens)
     sp = tokens.spacing()
-    base = f"""
-QWidget {{ font-size: {tokens.font_pt}pt; }}
-#titleBar {{ background: transparent; }}
-"""
+    # 字体：**按语言给候选链**（缺字体会整屏方块——实测踩过），而不是靠系统默认
+    base = font_qss(getattr(tokens, "locale", "zh-CN"), size_pt=tokens.font_pt)
+    base += "#titleBar { background: transparent; }\n"
     # 所有卡片名走**同一个**生成器（铁律）
     for name in ("card", "statCard", "panel", "settingsCard", "taskCard"):
         base += card_qss(tokens, object_name=name)

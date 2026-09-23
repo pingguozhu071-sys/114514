@@ -52,6 +52,38 @@ def status_colors(light: bool = False) -> dict:
     return dict(_STATUS_LIGHT if light else _STATUS_DARK)
 
 
+# ── 字体：**按语言选**（不许"中文界面用日文字体"这类蠢问题）────────────
+# 为什么必须显式指定：实测（offscreen 渲染截图）发现，Qt 找不到字体时**整屏文字变方块**——
+# 之前我们完全依赖系统默认字体，等于把"能不能显示"交给运气。这里按语言给一条**有优先级的
+# 字体链**，Qt 会挑第一个装了的：中文→微软雅黑，日文→Meiryo，英文→Segoe UI。
+_FONT_CHAIN = {
+    "zh-CN": ("Microsoft YaHei UI", "Microsoft YaHei", "微软雅黑", "SimHei",
+              "Noto Sans CJK SC", "Segoe UI"),
+    "ja-JP": ("Meiryo UI", "Meiryo", "メイリオ", "Yu Gothic UI", "MS Gothic",
+              "Noto Sans CJK JP", "Segoe UI"),
+    "en-US": ("Segoe UI", "Helvetica Neue", "Noto Sans", "DejaVu Sans"),
+}
+_MONO_CHAIN = ("Cascadia Mono", "Consolas", "DejaVu Sans Mono", "Courier New", "monospace")
+
+
+def font_chain(locale: str = "zh-CN") -> tuple[str, ...]:
+    """该语言的界面字体候选链（按优先级）。未知语言回退 en-US 的链。"""
+    return _FONT_CHAIN.get(str(locale), _FONT_CHAIN["en-US"])
+
+
+def mono_chain() -> tuple[str, ...]:
+    """等宽字体链（日志视图用）。"""
+    return _MONO_CHAIN
+
+
+def font_qss(locale: str = "zh-CN", *, size_pt: float = 10.0) -> str:
+    """全局字体 QSS：把候选链写进去（Qt 自己挑装了的那一个）。"""
+    fams = ", ".join(f'"{f}"' if " " in f else f for f in font_chain(locale))
+    mono = ", ".join(f'"{f}"' if " " in f else f for f in mono_chain())
+    return (f"* {{ font-family: {fams}; font-size: {float(size_pt):.1f}pt; }}\n"
+            f"#logView, #logView * {{ font-family: {mono}; }}\n")
+
+
 def accent_presets() -> list[dict]:
     return [{"name": n, "hex": h} for n, h in ACCENT_PRESETS]
 
@@ -180,6 +212,10 @@ class Tokens:
     dim_manual: float = 0.0            # 0–60（**手动只能加暗**）
     focus: str = "center"              # 九宫格焦点
     downsample_max: int = 2560         # 长边上限
+    # 界面语言（**已解析过的**：设置 > 安装器选择 > 系统 > en-US，见 `ui/i18n.py`）。
+    # 令牌带着它，是为了保证"语言与外观在同一次重刷里一致"——不许出现
+    # "标题换了日文、导航还是中文"这种半截状态。
+    locale: str = "zh-CN"
 
     def spacing(self) -> dict:
         d = self._DENSITY.get(str(self.density)) or self._DENSITY["standard"]

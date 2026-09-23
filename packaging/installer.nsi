@@ -117,11 +117,14 @@ Section "!核心程序（必需）" SEC_CORE
     File /r "..\dist\daedalus\*.*"
     File "art\license.txt"
 
-    ; 登记安装的凭据：卸载时靠它判断"这是我们装的"
+    ; 登记安装的凭据：卸载时靠它判断"这是我们装的"；**同时记下安装时选的语言**，
+    ; 程序启动时读它决定界面语言（顺序：用户设置 > 这里 > 系统 UI 语言 > en-US）。
+    ; 机主的硬要求：安装时选了简体中文，装完就绝不能蹦出日文——靠这一行兑现。
     FileOpen $0 "$INSTDIR\${APP_MARKER}" w
     FileWrite $0 "version=${APP_VERSION}$\r$\n"
     FileWrite $0 "installed=1$\r$\n"
     FileWrite $0 "exe=${APP_EXE}$\r$\n"
+    FileWrite $0 "lang=$LANGUAGE$\r$\n"
     FileClose $0
 
     ; 开始菜单 + 桌面快捷方式（共享资源：卸载时按登记条件化清理）

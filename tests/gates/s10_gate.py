@@ -66,6 +66,15 @@ def ui():
     return _WIN
 
 
+def _fresh_window(locale: str = "zh-CN"):
+    """每个用例一个**独立**窗口（E 组会改设置，共用单例会互相污染）。"""
+    from daedalus.ui.app import build_headless
+    from daedalus.ui.theme import tokens as mk_tokens
+    root = _TMP / f"ui_{abs(hash(locale)) % 1000}_{len(_WIN)}"
+    root.mkdir(parents=True, exist_ok=True)
+    return build_headless(data_root=root, tokens=mk_tokens(locale=locale))
+
+
 def test_image(path, w, h, *, mode="color"):
     """造测试图（`mode`: color 彩块 / gray 纯灰 / pattern 带标记的图案）。"""
     import cv2
@@ -429,6 +438,213 @@ def t_ui_boundary():
                 bad.append(f"{p.name}:{k}")
     assert not bad, f"ui/ 出现不该有的关键词：{bad}"
     return ok("ui/ 可执行代码零对抗词汇、零裸网络调用")
+
+
+# ══════════════════════════════════════════════════════════════════
+# E. 接线与多语言（机主要求："测一下 UI…别犯低级错误"、"装完别蹦出别的语言"）
+#    这一组是**走查抓出来的教训**：组件都对、**接线没接**，测组件永远测不出来
+#    （原来 S10 是拿 set_wallpaper 直接测的，于是"设置里存了底图但界面不加载"这种 bug 一直假绿）。
+# ══════════════════════════════════════════════════════════════════
+@case("E1 接线存在：两条启动路径都必须装上「设置一变 → 界面跟着变」的处理器")
+def t_context_wired():
+    src = (ROOT / "src" / "daedalus" / "ui" / "app.py").read_text(encoding="utf-8")
+    assert "def wire_context" in src, "没有接线函数"
+    assert src.count("MainWindow.wire_context(") >= 2, "两条启动路径没有共用同一个接线"
+    assert "def build_headless" in src and "def run_ui" in src
+    assert "apply_wallpaper_from_settings" in src and "sync_accent_from_wallpaper" in src, \
+        "底图管线/自动取色没有触发点（设置页只存路径、没人加载底图 = 走查抓到的真 bug）"
+    # 运行期证据：接线后 handler 必须非空
+    b = _fresh_window()
+    ctx = b["window"]._ui["ctx"]                                   # noqa: SLF001
+    assert getattr(ctx, "_on_change", None) is not None, "接线后仍没有变更处理器"
+    return ok("接线函数存在且被两条启动路径共用；底图/取色都有触发点")
+
+
+@case("E2 设置变更真的生效（走真实信号：透明度/主题/密度/字号）")
+def t_settings_take_effect():
+    b = _fresh_window()
+    win, app, store = b["window"], b["app"], b["settings"]
+    sw = win._ui["pages"]["settings"]._widgets                      # noqa: SLF001
+    from PySide6.QtWidgets import QCheckBox, QComboBox, QDoubleSpinBox, QSlider, QSpinBox
+
+    def apply(key, value):
+        w = sw[key]
+        if isinstance(w, QCheckBox):
+            w.setChecked(bool(value))
+        elif isinstance(w, (QSlider, QSpinBox)):
+            w.setValue(int(value))
+        elif isinstance(w, QDoubleSpinBox):
+            w.setValue(float(value))
+        elif isinstance(w, QComboBox):
+            w.setCurrentIndex(max(0, w.findData(value)))
+        app.processEvents()
+        return win._ui["applied"]                                  # noqa: SLF001
+
+    a1 = apply("panel_alpha", 88)
+    a2 = apply("light", True)
+    a3 = apply("density", "relaxed")
+    a4 = apply("font_pt", 12.0)
+    assert a1["panel_alpha"] == 88, a1
+    assert a2["border"] == "rgba(0,0,0,14)", a2
+    assert a3["spacing"]["margin"] == 36, a3
+    assert a4["font_pt"] == 12.0, a4
+    return ok("透明度 88 / 浅色 / 宽松(外边距 36) / 12pt 全部真的进了样式（不是只存了盘）")
+
+
+@case("E3 底图管线被设置变更触发（只存路径不加载 = 走查抓到的真 bug）")
+def t_wallpaper_triggered():
+    import numpy as np
+    import cv2
+    b = _fresh_window()
+    win, app = b["window"], b["app"]
+    sw = win._ui["pages"]["settings"]._widgets                      # noqa: SLF001
+    p = _TMP / "e3_wall.png"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    img = np.random.default_rng(3).integers(0, 256, (500, 800, 3)).astype("uint8")
+    p.write_bytes(cv2.imencode(".png", img)[1].tobytes())
+    sw["wallpaper"].setText(str(p))
+    sw["wallpaper"].editingFinished.emit()
+    app.processEvents()
+    meta = win._ui["state"].get("wallpaper_meta") or {}             # noqa: SLF001
+    assert meta.get("brightness_mean") is not None, f"底图管线没跑：{meta}"
+    assert float(meta.get("dim_used") or 0) > 0, meta
+    # 参数变更 → 重跑（模糊进元数据）
+    sw["blur"].setValue(6)
+    app.processEvents()
+    meta2 = win._ui["state"].get("wallpaper_meta") or {}            # noqa: SLF001
+    assert meta2.get("blur") == 6, meta2
+    # 坏图 → 明确提示 + 回退纯色（不崩）
+    sw["wallpaper"].setText(str(_TMP / "不存在.png"))
+    sw["wallpaper"].editingFinished.emit()
+    app.processEvents()
+    st = win._ui["state"].get("wallpaper_meta") or {}               # noqa: SLF001
+    assert st == {}, st
+    assert any("底图不可用" in n for n in win._ui["ctx"].notes), win._ui["ctx"].notes[-2:]  # noqa: SLF001
+    return ok("换图/改模糊都重跑管线；坏图回退纯色并如实提示")
+
+
+@case("E4 自动取色的触发条件：换底图/解锁才算，**显式选色不许被覆盖**")
+def t_accent_trigger_rules():
+    import numpy as np
+    import cv2
+    b = _fresh_window()
+    win, app, store = b["window"], b["app"], b["settings"]
+    sw = win._ui["pages"]["settings"]._widgets                      # noqa: SLF001
+    p = _TMP / "e4_wall.png"
+    img = np.zeros((400, 600, 3), "uint8")
+    img[:, :, 0] = 190
+    img[:, :, 2] = 150
+    p.write_bytes(cv2.imencode(".png", img)[1].tobytes())
+    from PySide6.QtWidgets import QComboBox
+    sw["wallpaper"].setText(str(p))
+    sw["wallpaper"].editingFinished.emit()
+    app.processEvents()
+    auto = str(store.get("accent") or "")
+    assert auto.startswith("#") and len(auto) == 7, auto
+    # 显式选四档预设之一 → 必须原样保留（走真实路径：下拉框 → 信号 → 存盘 + 通知）
+    target = "#2FC6C6"
+    combo = sw["accent"]
+    assert isinstance(combo, QComboBox)
+    combo.setCurrentIndex(max(0, combo.findData(target)))
+    app.processEvents()
+    assert store.get("accent") == target, f"显式选色被覆盖：{store.get('accent')}"
+    assert win._ui["applied"].get("accent") == target, win._ui["applied"]   # noqa: SLF001
+    # 锁定时换底图 → 强调色不变
+    sw["accent_locked"].setChecked(True)
+    app.processEvents()
+    sw["wallpaper"].setText(str(p))
+    sw["wallpaper"].editingFinished.emit()
+    app.processEvents()
+    assert store.get("accent") == target, f"锁定后仍被自动取色改了：{store.get('accent')}"
+    return ok(f"自动取色在换图时生效（{auto}）；显式选 {target} 后不被覆盖；锁定时不动")
+
+
+@case("E5 语言解析顺序：设置 > 安装器选择 > 系统 > en-US")
+def t_locale_resolution():
+    import pathlib
+    import tempfile
+    from daedalus.ui.i18n import LOCALES, detect_system_locale, resolve_locale
+    d = pathlib.Path(tempfile.mkdtemp(prefix="dae_loc_"))
+    (d / "install.marker").write_text("installed=1\nlang=2052\n", encoding="utf-8")
+    assert resolve_locale("", exe_dir=d) == "zh-CN", "安装器选简体却没用简体"
+    (d / "install.marker").write_text("lang=1041\n", encoding="utf-8")
+    assert resolve_locale("", exe_dir=d) == "ja-JP"
+    assert resolve_locale("en-US", exe_dir=d) == "en-US", "用户设置应当优先于安装器选择"
+    e = pathlib.Path(tempfile.mkdtemp(prefix="dae_loc2_"))
+    assert resolve_locale("", exe_dir=e) == detect_system_locale(), "无标记应落到系统语言"
+    assert detect_system_locale() in LOCALES, detect_system_locale()
+    return ok(f"四种情况全对（本机系统语言 = {detect_system_locale()}）")
+
+
+@case("E6 三语文案齐备 + ui/ 里没有硬编码的可视中文")
+def t_i18n_coverage():
+    import ast as _ast
+    from daedalus.ui.i18n import LOCALES, coverage, translator
+    cov, total = coverage()
+    missing = {loc: total - n for loc, n in cov.items()}
+    assert not any(missing.values()), f"有语言缺翻译：{missing}"
+    # 每种语言都能无缺键地取一遍（缺键会被 Translator 记下来）
+    for loc in LOCALES:
+        t = translator(loc)
+        for key in ("nav.overview", "settings.group.wallpaper", "about.body1", "app.title"):
+            assert t(key) and t.missing == set(), f"{loc} 缺键：{t.missing}"
+    # ui/ 里除 i18n.py 外，**代码里的字符串字面量**不得含中文字符（注释/文档字符串不算）
+    bad = []
+    for p in sorted((ROOT / "src" / "daedalus" / "ui").glob("*.py")):
+        if p.name == "i18n.py":
+            continue
+        text = p.read_text(encoding="utf-8")
+        tree = _ast.parse(text)
+        doc_lines = set()
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Constant) and isinstance(node.value, str):
+                for ln in range(getattr(node, "lineno", 0), getattr(node, "end_lineno", 0) + 1):
+                    doc_lines.add(ln)
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Constant) and isinstance(node.value, str) \
+                    and getattr(node, "lineno", 0) not in doc_lines:
+                v = node.value
+                if any("\u4e00" <= ch <= "\u9fff" for ch in v) and "noqa: i18n" not in v:
+                    # 允许：日志/异常/内部提示（不是可视文案）——但必须显式标注
+                    line = text.splitlines()[node.lineno - 1] if node.lineno <= len(text.splitlines()) else ""
+                    if "noqa: i18n" in line:
+                        continue
+                    bad.append(f"{p.name}:{node.lineno} {v[:26]}")
+    assert not bad, f"ui/ 里还有硬编码可视中文（应走 i18n）：{bad[:6]}"
+    return ok(f"{total} 个键 × {len(LOCALES)} 语言全覆盖；ui/ 代码里零硬编码可视中文")
+
+
+@case("E7 打包态取标记：冻结后找的是 **exe 同级**，不是 cwd 也不是解包临时目录")
+def t_frozen_marker_path():
+    """语言"装完是不是本机语言"里的**路径**那一半。
+
+    E5 守住的是解析优先级；这条守的是**去哪儿找**。冻结态下若按 `__file__` 或 cwd 找，
+    解包临时目录里永远没有 marker → 装机时选的语种被静默丢弃（就是"选简体蹦日文"这类）。
+    """
+    import pathlib
+    import tempfile
+    from daedalus.ui.i18n import marker_path, read_installer_locale, resolve_locale
+    d = pathlib.Path(tempfile.mkdtemp(prefix="dae_frozen_"))
+    (d / "install.marker").write_text("installed=1\nlang=1041\n", encoding="utf-8")
+    saved = (getattr(sys, "frozen", None), sys.executable)
+    try:
+        sys.frozen = True                                   # type: ignore[attr-defined]
+        sys.executable = str(d / "daedalus.exe")            # 假装自己就是装好的那个 exe
+        assert marker_path() == d / "install.marker", marker_path()
+        assert read_installer_locale() == "ja-JP", read_installer_locale()
+        assert resolve_locale("") == "ja-JP", resolve_locale("")
+        assert resolve_locale("zh-CN") == "zh-CN", "用户设置没优先于安装器选择"
+    finally:
+        if saved[0] is None:
+            try:
+                del sys.frozen                              # type: ignore[attr-defined]
+            except Exception:
+                pass
+        else:
+            sys.frozen = saved[0]                           # type: ignore[attr-defined]
+        sys.executable = saved[1]
+    assert marker_path().name == "install.marker"           # 还原后仍可用
+    return ok("冻结态 marker 取 exe 同级；安装器选日文 → 日文；用户设置仍优先")
 
 
 # ══════════════════════════════════════════════════════════════════

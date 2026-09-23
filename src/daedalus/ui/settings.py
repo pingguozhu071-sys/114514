@@ -16,6 +16,7 @@ import os
 import pathlib
 import time
 
+from daedalus.ui.i18n import resolve_locale
 from daedalus.ui.theme import ACCENT_PRESETS, ThemeError, tokens
 
 logger = logging.getLogger(__name__)
@@ -25,7 +26,8 @@ __all__ = ["SettingsStore", "FACTORY_PRESETS", "settings_path"]
 _FIELDS = ("light", "accent", "accent_locked", "panel_alpha", "radius", "font_pt", "density",
            "animations", "fade_ms", "debounce_ms", "fps_cap", "signature", "expert_mode",
            "wallpaper", "wallpaper_dir", "wallpaper_mode", "blur", "dim_manual", "focus",
-           "downsample_max", "theme_name", "log_autoscroll", "page")
+           "downsample_max", "theme_name", "log_autoscroll", "page",
+           "locale")   # 界面语言：""=跟随系统 / "zh-CN" / "ja-JP" / "en-US"
 
 # 出厂预设（"命名保存/加载/导入导出"里的那批）
 FACTORY_PRESETS: dict = {
@@ -60,7 +62,8 @@ class SettingsStore:
                 "signature": True, "expert_mode": False,
                 "wallpaper": "", "wallpaper_dir": "", "wallpaper_mode": "single",
                 "blur": 0, "dim_manual": 0.0, "focus": "center", "downsample_max": 2560,
-                "theme_name": "", "log_autoscroll": True, "page": "overview"}
+                "theme_name": "", "log_autoscroll": True, "page": "overview",
+                "locale": ""}
 
     def load(self) -> dict:
         if not self.path.exists():
@@ -137,6 +140,8 @@ class SettingsStore:
                                            "top_left", "top_right", "bottom_left",
                                            "bottom_right"):
             raise ThemeError(f"未知焦点：{value}")
+        if key == "locale" and str(value) not in ("", "zh-CN", "ja-JP", "en-US"):
+            raise ThemeError(f"未知界面语言：{value!r}（合法：空=跟随系统 / zh-CN / ja-JP / en-US）")
 
     # ── 预设 ────────────────────────────────────────────────────
     def save_preset(self, name: str, *, patch: dict | None = None) -> dict:
@@ -207,4 +212,5 @@ class SettingsStore:
                       expert_mode=bool(self.data["expert_mode"]),
                       wallpaper=str(self.data["wallpaper"]), blur=int(self.data["blur"]),
                       dim_manual=float(self.data["dim_manual"]), focus=str(self.data["focus"]),
-                      downsample_max=int(self.data["downsample_max"]))
+                      downsample_max=int(self.data["downsample_max"]),
+                      locale=resolve_locale(self.data.get("locale")))
