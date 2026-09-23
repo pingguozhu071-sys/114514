@@ -315,18 +315,42 @@ def t_policy_defaults():
     return ok("7 项默认值 + 原始层恒等")
 
 
-@case("C2 正交性：关 log_text 时手机号保留，但 log_url 仍生效")
+@case("C2 正交性：关 log_text 时隐私保留，但 log_url 的**非凭据**参数仍按开关走")
 def t_policy_orthogonal():
+    """开关只管**非凭据**的部分。
+
+    安全自审后的语义（更严）：**凭据形态永远脱敏、不受开关影响**（T1 硬要求"日志无敏感"）。
+    所以这里用**非凭据**参数（`q=`/`id=`）来验正交性——用 `token=` 验会把红线一起关掉，
+    那正是自审发现并封掉的旧漏洞。凭据不可关由 C2b 单独钉住。
+    """
     from daedalus.obs.policy import SanitizationPolicy
     p = SanitizationPolicy().with_toggle("log_text", False)
-    line = "访问 https://h/p?token=SECRET 联系13812345678"
+    line = "访问 https://h/p?q=hello&id=7 联系13812345678"
     out = p.scrub_log(line)
-    assert "SECRET" not in out, "log_url 应仍生效"
+    assert "hello" in out, "log_url 应仍生效（默认开）"
     assert "13812345678" in out, "log_text 关掉后应保留原文"
     q = SanitizationPolicy().with_toggle("log_url", False)
     out2 = q.scrub_log(line)
-    assert "SECRET" in out2 and "13812345678" not in out2, "反向正交失败"
-    return ok("两个开关互不干扰")
+    assert "hello" in out2 and "13812345678" not in out2, "反向正交失败"
+    return ok("两个开关互不干扰（非凭据参数）")
+
+
+@case("C2b 凭据不可关（红线）：所有开关关掉，凭据形态仍被脱敏")
+def t_credentials_always():
+    """安全自审发现的旧漏洞：把 `log_url`/`log_text` 都关掉 → token 明文进日志（可达配置）。
+
+    现在凭据走独立通路（`sanitize_credentials`），**不吃任何开关**——因为它属于
+    "日志无敏感"这条红线，不属于"每类型可配"的隐私开关。
+    """
+    from daedalus.obs.policy import SanitizationPolicy
+    p = SanitizationPolicy().with_toggle("log_url", False).with_toggle("log_text", False)
+    line = ("Authorization: Bearer TOK1 Cookie: sid=TOK2 "
+            "https://h/p?token=TOK3&api_key=TOK4 sid=TOK5")
+    out = p.scrub_log(line)
+    leaked = [t for t in ("TOK1", "TOK2", "TOK3", "TOK4", "TOK5") if t in out]
+    assert not leaked, f"关掉开关后凭据泄漏：{leaked}｜{out}"
+    assert "[REDACTED]" in out, out
+    return ok("5 类凭据形态（Bearer/Cookie/token/api_key/键值）在开关全关时仍脱敏")
 
 
 @case("C3 出口各自独立：export 默认恒等；打开后脱敏；UI/派生同理")

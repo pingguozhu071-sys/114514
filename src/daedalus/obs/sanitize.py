@@ -34,17 +34,31 @@ import re
 
 __all__ = [
     "sanitize_url", "sanitize_text", "sanitize_headers", "sanitize_proxy",
-    "sanitize_record", "find_emails",
+    "sanitize_record", "sanitize_credentials", "find_emails",
 ]
 
 # URL 里的敏感**参数值**：不纳入过于通用的 code/uid（会误伤正常业务参数）。
 # ⚠️ 值字符类**必须在空白与引号/尖括号处停下**——否则 `[^&#]+` 会一路吃到下一个 `&` 或串尾，
 #    把 URL 之后的正文一起抹掉（例："token=SECRET 联系138…" 会把后半句也变成 [REDACTED]）。
 #    这是本工程自建门禁（`tests/gates/s1_gate.py` C2）抓出来的**真实缺陷**，参考实现里有这个洞。
+_URL_SECRET_KEYS = (
+    r"token|key|auth|session|sid|password|passwd|access_token|refresh_token|api_key|apikey"
+    r"|api-key|sig|sign|signature|secret|ticket|csrf|nonce|code|jwt|assertion|saml|bearer"
+    r"|credential|oauth|id_token|sessionid|jsessionid|phpsessid"
+)
+# 分隔符要认三种（**安全自审补的**）：`?a=1&token=X`（标准）· `?a=1;token=X`（分号风格，
+# 老站点与某些网关在用，原来会漏）· `#token=X`（fragment 里的参数，原来也会漏）。
 _URL_SECRET_RE = re.compile(
-    r"([?&](?:token|key|auth|session|sid|password|passwd|access_token|refresh_token"
-    r"|api_key|apikey|api-key|sig|sign|signature|secret|ticket|csrf|nonce)=)[^\s&#\"'<>]+",
+    rf"([?&;](?:{_URL_SECRET_KEYS})=)[^\s&#\"'<>;]+",
     re.IGNORECASE)
+_URL_FRAG_SECRET_RE = re.compile(
+    rf"([#&;](?:{_URL_SECRET_KEYS})=)[^\s&#\"'<>;]+",
+    re.IGNORECASE)
+# URL 里的 userinfo（`https://user:pass@host/`）——**安全自审发现的真缺口**：
+# 带凭据的直链很常见（Basic Auth / 预签名 URL），原来完全不脱敏，日志与导出里会明文留下口令。
+# 两种写法都要认：`user:pass@` 与裸 `user@`。
+_URL_USERINFO_RE = re.compile(r"([A-Za-z][A-Za-z0-9+.\-]*://)([^/@\s:]{1,256}:[^/@\s]{1,256})@")
+_URL_BARE_USER_RE = re.compile(r"([A-Za-z][A-Za-z0-9+.\-]*://)([^/@:\s]{1,256})@")
 
 SENSITIVE_HEADERS = {
     "authorization", "cookie", "set-cookie", "proxy-authorization",
@@ -64,15 +78,50 @@ _IP_RE = re.compile(
 
 
 def sanitize_url(url: str) -> str:
-    """抹掉 URL 里敏感参数的值（保留参数名，便于看懂是哪个参数）。"""
+    """抹掉 URL 里敏感参数的值（保留参数名与结构，便于看懂是哪个参数被抹了）。
+
+    覆盖四类（③④ 是**安全自审**补的缺口）：
+      ① query 参数值（`?token=` / `&token=` / `;token=`）——保留参数名；
+      ② fragment 里的参数（`#token=`）；
+      ③ **userinfo 凭据**（`https://user:pass@host/` → `https://[REDACTED]@host/`）；
+      ④ 一次性凭据键（`code=` 这类 OAuth 授权码：拿到就能换 token）。
+    """
     try:
-        return _URL_SECRET_RE.sub(r"\1[REDACTED]", str(url or ""))
+        s = str(url or "")
+        s = _URL_SECRET_RE.sub(r"\1[REDACTED]", s)
+        s = _URL_FRAG_SECRET_RE.sub(r"\1[REDACTED]", s)
+        if "@" in s:
+            s = _URL_USERINFO_RE.sub(r"\1[REDACTED]@", s)
+            s = _URL_BARE_USER_RE.sub(r"\1[REDACTED]@", s)
+        return s
     except Exception:
         return url
 
 
+def sanitize_credentials(text: str) -> str:
+    """抹掉**文本里的凭据形态**（不受任何开关影响——T1 的硬要求是"日志无敏感"）。
+
+    三类（安全自审补的缺口：原来日志出口只认 URL 参数/手机号/邮箱/IP，
+    而 header 转储与异常消息里的 token 会明文落盘）：
+      ① `Bearer <token>` / `Basic <base64>`；
+      ② header 行：`Authorization:` / `Cookie:` / `Set-Cookie:` / `X-Api-Key:` …
+      ③ `key=value` 形态的敏感键（`token=`/`sid=`/`api_key=`…，不含 `code`/`key` 这类
+         在普通日志里太常见的词，见 `_TEXT_KV_SECRET_KEYS` 的注释）。
+
+    ⚠️ **顺序有意为之**：先 scheme（`Bearer X`）再 header 行——反过来 header 行会把
+    `Bearer` 当成值吃掉，剩下裸 token 谁也认不出来（自审实测踩过）。
+    """
+    t = str(text or "")
+    if "earer" in t or "asic " in t:
+        t = _TEXT_SCHEME_SECRET_RE.sub(r"\1 [REDACTED]", t)
+    if ":" in t or "=" in t:
+        t = _TEXT_HEADER_SECRET_RE.sub(r"\1: [REDACTED]", t)
+        t = _TEXT_KV_SECRET_RE.sub(r"\1=[REDACTED]", t)
+    return t
+
+
 def sanitize_text(text: str) -> str:
-    """脱敏文本中的手机号 / 邮箱 / IP。
+    """脱敏文本中的**隐私**（手机号 / 邮箱 / IP）。**不管凭据**——那是 `sanitize_credentials`。
 
     中文边界坑：不能只用 `\\b`——在"汉字↔数字"之间词边界不成立（`\\w` 含 CJK），
     "联系13812345678或" 会漏脱敏。故用纯数字边界 `(?<!\\d)` / `(?!\\d)`。
@@ -136,6 +185,39 @@ _TEXTISH_KEYS = frozenset({
 _DEEP_TEXT_CONTAINERS = frozenset({"entities", "json_ld", "structured", "metadata", "extra"})
 _REC_MAX_DEPTH = 6
 
+# ── 文本出口的"凭据形态"（安全自审补的缺口）───────────────────────
+# 自审发现：日志出口原来只认 URL 里的参数、手机号、邮箱、IP——而**自由文本里的 header 转储**
+# （`Authorization: Bearer X` / `Cookie: sid=X`）会原样落盘。真实触发路径是把请求头/响应头
+# 或异常消息记进日志（调试时最常见），一旦发生就是明文凭据泄漏。这里补三类：
+#   ① header 行：`Authorization:` / `Cookie:` / `Set-Cookie:` / `X-Api-Key:` …
+#   ② 认证方案：`Bearer <token>` / `Basic <base64>`
+#   ③ `key=value` 形态的敏感键（不含 URL 分隔符也认）
+_TEXT_HEADER_SECRET_RE = re.compile(
+    r"(?i)\b(proxy-authorization|authorization|set-cookie|cookie|x-api-key|x-auth-token"
+    r"|x-csrf-token|x-session-id|api-key|apikey)\b\s*[:=]\s*(?:bearer|basic)?\s*[^\s,;\"']+")
+_TEXT_SCHEME_SECRET_RE = re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=\-]{8,}")
+# 注意：这里**刻意不含** `key`/`auth`/`code`——它们在普通日志里太常见（`exit code=1`、
+# `key=value` 的字典打印），收进来会把日志涂满 [REDACTED]，反而看不清问题。
+# URL 语境下它们仍然会被 URL 规则脱敏（那里 `code=` 基本就是 OAuth 授权码）。
+_TEXT_KV_SECRET_KEYS = (
+    r"token|access_token|refresh_token|id_token|api_key|apikey|password|passwd|secret"
+    r"|session|sessionid|jsessionid|phpsessid|csrf|nonce|signature|sig|ticket|jwt|sid"
+    r"|credential|private_key|secret_key|oauth_token"
+)
+_TEXT_KV_SECRET_RE = re.compile(rf"(?i)\b({_TEXT_KV_SECRET_KEYS})\s*=\s*[^\s&#\"'<>;]+")
+
+# 键名命中这些 → **整个值抹掉**（不是"再过一遍文本脱敏"：它本身就是凭据，
+# 里面没有任何值得保留的结构）。安全自审补的：原来只按 header 名抹，
+# 结构化字段里叫 `cookie`/`token`/`sid` 的键会漏。
+_SECRET_KEYS = frozenset({
+    "authorization", "proxy-authorization", "cookie", "set-cookie", "cookies", "set_cookie",
+    "token", "access_token", "refresh_token", "id_token", "oauth_token", "bearer",
+    "api_key", "apikey", "api-key", "x-api-key", "x-auth-token", "x-csrf-token",
+    "password", "passwd", "pass", "secret", "secret_key", "private_key", "credential",
+    "session", "session_id", "sessionid", "jsessionid", "phpsessid", "sid", "csrf", "nonce",
+    "signature", "sig", "ticket", "jwt", "assertion",
+}) | SENSITIVE_HEADERS
+
 
 def sanitize_record(data, *, max_depth: int = _REC_MAX_DEPTH):
     """返回一条记录的**脱敏副本**（不改动原对象；异常一律退回原值）。
@@ -153,17 +235,28 @@ def sanitize_record(data, *, max_depth: int = _REC_MAX_DEPTH):
     def _one(key, val, depth, deep_text=False):
         if depth > max_depth:
             return val
+        lk = str(key or "").lower()
+        # 键名本身就是凭据 → **整个值抹掉**（含嵌套容器里的全部字符串）
+        if lk in _SECRET_KEYS:
+            return _redact_all(val, depth)
         if isinstance(val, dict):
             return {k: _one(k, v, depth + 1, deep_text) for k, v in val.items()}
         if isinstance(val, (list, tuple)):
             return [_one(key, v, depth + 1, deep_text) for v in val]
         if isinstance(val, str) and val:
-            lk = str(key or "").lower()
             if val.startswith(("http://", "https://")) or lk in _URLISH_KEYS:
                 return sanitize_url(val)
             if deep_text or lk in _TEXTISH_KEYS:
                 return sanitize_text(val)
         return val
+
+    def _redact_all(val, depth):
+        """把一棵子树里的所有标量抹掉（键名已是凭据，值里没有值得保留的结构）。"""
+        if isinstance(val, dict):
+            return {k: _redact_all(v, depth + 1) for k, v in val.items()}
+        if isinstance(val, (list, tuple)):
+            return [_redact_all(v, depth + 1) for v in val]
+        return "[REDACTED]" if val not in (None, "") else val
 
     try:
         if isinstance(data, list):

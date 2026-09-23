@@ -27,8 +27,8 @@ from __future__ import annotations
 import logging
 from dataclasses import asdict, dataclass
 
-from daedalus.obs.sanitize import (sanitize_headers, sanitize_record, sanitize_text,
-                                   sanitize_url)
+from daedalus.obs.sanitize import (sanitize_credentials, sanitize_headers, sanitize_record,
+                                   sanitize_text, sanitize_url)
 
 __all__ = ["SanitizationPolicy", "KINDS", "DEFAULT_TOGGLES", "RAW_LAYER_SANITIZATION",
            "KIND_LABELS"]
@@ -135,8 +135,16 @@ class SanitizationPolicy:
 
     # ── 出口：日志 ────────────────────────────────────────────────
     def scrub_log(self, text) -> str:
-        """日志文本按 `log_url` / `log_text` 两个开关处理。"""
-        t = str(text or "")
+        """日志文本脱敏。**两层，可关性不同**：
+
+          ① **凭据形态永远脱敏**（`sanitize_credentials`）：header 转储、`Bearer/Basic`、
+             `token=/sid=/api_key=` 这类键值——**不受任何开关影响**。
+             理由：T1 的硬要求是"日志无敏感"。安全自审发现原来"把 `log_url`/`log_text`
+             都关掉 → token 明文进日志"是**可达配置**——那等于把红线做成了选项 ✗。
+          ② 可配的两类：`log_url`（URL 参数）与 `log_text`（手机号/邮箱/IP 这类隐私）。
+             这两个才归"每类型开关"管；凭据不在此列。
+        """
+        t = sanitize_credentials(str(text or ""))
         if self.log_url:
             t = sanitize_url(t)
         if self.log_text:
