@@ -647,6 +647,47 @@ def t_frozen_marker_path():
     return ok("冻结态 marker 取 exe 同级；安装器选日文 → 日文；用户设置仍优先")
 
 
+@case("E8 指标轮询：概览页数字**运行期真的会刷新**（不是永远停在占位符）")
+def t_metrics_poll():
+    """第三个接线缺口（我在打包态截图里看出来的）：`refresh_pages()` 写好了、
+    门禁也直接调它验收，但**全仓没有一个调用者**——真跑起来四张统计卡永远停在「—」、
+    任务表永远是空的。**测组件的用例永远发现不了"没人调用"这种事**。
+    """
+    import re
+    src = (ROOT / "src" / "daedalus" / "ui" / "app.py").read_text(encoding="utf-8")
+    assert "def start_metrics_poll" in src, "没有轮询函数"
+    assert "timer.timeout.connect(_poll)" in src, "定时器没接到轮询上"
+    assert re.search(r"MainWindow\.start_metrics_poll\(", src), "没人启动轮询（就是这次的 bug）"
+    b = _fresh_window()
+    win, app = b["window"], b["app"]
+    from daedalus.ui.app import MainWindow
+    info = win._ui                                                 # noqa: SLF001
+    assert callable(info.get("poll_fn")), "轮询函数没挂出来（门禁没法定点验收）"
+    ov = win._ui["pages"]["overview"]                               # noqa: SLF001
+    cards = getattr(ov, "_stat_cards", [])
+    assert len(cards) == 4, cards
+    before = [c._value_label.text() for c in cards]                 # noqa: SLF001
+    # 走真实路径：给 ctx 一个假引擎（只实现 metrics），调轮询函数 → 数字必须变
+    class _FakeEngine:
+        def metrics(self):
+            return {"summary": {"pages_per_sec": 12.3, "mb_per_sec": 1.25, "tasks_done": 7,
+                                "tasks_failed": 2, "net_latency_p95": 0.042},
+                    "tasks": [{"task_id": "t1", "state": "done", "target": "https://e.test/a",
+                               "content_hash": "ab" * 32, "kind": "page"}]}
+    ctx = win._ui["ctx"]                                            # noqa: SLF001
+    ctx.engine = _FakeEngine()
+    info["poll_fn"]()
+    app.processEvents()
+    after = [c._value_label.text() for c in cards]                  # noqa: SLF001
+    assert before != after, f"轮询后数字没变：{after}"
+    assert after[0].startswith("12.3"), after
+    assert after[3].endswith("ms"), after
+    rec = info["poll"]
+    assert rec["count"] >= 1 and rec["last_ms"] >= 0, rec
+    return ok(f"轮询存在且被启动；一次轮询把占位符 {before[0]!r} 换成 {after[0]!r}"
+              f"（耗时 {rec['last_ms']:.1f}ms，红线 {MainWindow.SLOW_MS}ms 超了会自动降频）")
+
+
 # ══════════════════════════════════════════════════════════════════
 def main() -> int:
     fails = skips = 0

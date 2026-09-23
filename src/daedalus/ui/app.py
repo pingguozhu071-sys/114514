@@ -263,7 +263,67 @@ class MainWindow:
         MainWindow.apply_wallpaper_from_settings(win, store, store.to_tokens())
         MainWindow.sync_accent_from_wallpaper(win, store, store.to_tokens())
         MainWindow.apply_tokens(win, store.to_tokens())
+        MainWindow.start_metrics_poll(win, ctx)
         return {"wired": True}
+
+    # 指标轮询：**默认 1 秒一拉**；单次超过 `SLOW_MS` 就自动降频（宁可少刷，不许卡手）
+    POLL_MS = 1000
+    SLOW_MS = 250          # 与"停顿 < 200ms"的性能红线同源；超了就说明这一拉太重
+    POLL_MS_BACKOFF = 5000
+
+    @staticmethod
+    def start_metrics_poll(win, ctx) -> dict:
+        """把指标**周期性**刷进概览页与任务表（走查抓到的第三个接线缺口）。
+
+        真 bug：`refresh_pages()` 写好了、门禁也直接调它验收，但**全仓没有一个调用者**——
+        真跑起来四张统计卡永远停在占位符「—」、任务表永远是空的。测组件的用例发现不了这个，
+        所以这里配套加了门禁断言（"存在调用者" + "真拉一次真的变了"）。
+
+        代价控制：`engine.metrics()` 里有 `tasks_overview(limit=50)`（一次读库）。
+        所以 ① 只有拿到引擎才拉；② 记下每次耗时，> `SLOW_MS` 就**自动降到 5 秒一拉**并如实记在
+        `_ui["poll"]` 里（门禁与探针都读它）——绝不为了"数字好看"把界面卡住。
+        """
+        from PySide6.QtCore import QTimer
+        info = win._ui                                   # noqa: SLF001
+        rec = {"count": 0, "last_ms": 0.0, "max_ms": 0.0, "slow": 0, "errors": 0,
+               "interval_ms": MainWindow.POLL_MS, "last_summary": {}}
+        info["poll"] = rec
+
+        def _poll() -> None:
+            import time as _t
+            t0 = _t.perf_counter()
+            try:
+                m = ctx.refresh()                        # 走 ctx（页面不直连引擎，窗口也不）
+                if m:
+                    rec["last_summary"] = dict(m.get("summary") or {})
+                    MainWindow.refresh_pages(win, m)
+            except Exception as e:                       # 读数失败不该让界面崩，但也**不静默**
+                rec["errors"] += 1
+                logger.debug("指标刷新失败：%s", e)
+            dt = (_t.perf_counter() - t0) * 1000.0
+            rec["count"] += 1
+            rec["last_ms"] = dt
+            rec["max_ms"] = max(rec["max_ms"], dt)
+            if dt > MainWindow.SLOW_MS:
+                rec["slow"] += 1
+                if rec["interval_ms"] != MainWindow.POLL_MS_BACKOFF and timer is not None:
+                    rec["interval_ms"] = MainWindow.POLL_MS_BACKOFF
+                    timer.setInterval(MainWindow.POLL_MS_BACKOFF)
+                    logger.warning("指标刷新单次耗时 %.0fms（超过红线 %dms）→ 自动降频到 %dms",
+                                   dt, MainWindow.SLOW_MS, MainWindow.POLL_MS_BACKOFF)
+
+        timer = None
+        try:
+            timer = QTimer(win)
+            timer.setInterval(MainWindow.POLL_MS)
+            timer.timeout.connect(_poll)
+            timer.start()
+        except Exception as e:                           # 无头环境没有事件循环也照样能用（门禁直接调 _poll）
+            logger.debug("指标定时器没起来（无事件循环？）：%s", e)
+        info["poll_fn"] = _poll                          # 门禁/走查直接调它，不必等 1 秒
+        info["poll_timer"] = timer
+        _poll()                                          # 立刻拉一次，别让用户先看一秒占位符
+        return rec
 
     @staticmethod
     def apply_wallpaper_from_settings(win, store, tokens) -> dict:

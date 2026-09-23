@@ -271,6 +271,32 @@ def walk(*, verbose: bool = True) -> dict:
     check("引擎未启动也能画（ctx.engine=None）", len(ui["pages"]) == 5,
           f"页面数 {len(ui['pages'])}")
 
+    # ── J. 概览页数字**真的会刷新**（打包态截图看出来的第三个接线缺口）──
+    #    刷新函数写好了、门禁也直接调它，但真跑起来**没有任何调用者**，数字永远停在「—」。
+    poll_fn = ui.get("poll_fn")
+    cards = getattr(ui["pages"]["overview"], "_stat_cards", [])
+    before = [c._value_label.text() for c in cards] if cards else []   # noqa: SLF001
+
+    class _FakeEngine:
+        def metrics(self):
+            return {"summary": {"pages_per_sec": 9.5, "mb_per_sec": 0.5, "tasks_done": 3,
+                                "tasks_failed": 1, "net_latency_p95": 0.03},
+                    "tasks": [{"task_id": "w1", "state": "done", "target": "https://e.test/x",
+                               "content_hash": "cd" * 32, "kind": "page"}],
+                    "fetcher": {}, "frontier": {}, "writer": {}, "ledger": {}, "alerts": []}
+    ui["ctx"].engine = _FakeEngine()
+    try:
+        poll_fn() if callable(poll_fn) else None
+        app.processEvents()
+    except Exception as e:
+        check("概览页指标轮询可用", False, f"{type(e).__name__}: {e}")
+    after = [c._value_label.text() for c in cards] if cards else []     # noqa: SLF001
+    rec = ui.get("poll") or {}
+    check("概览页数字运行期真的刷新（不是永远停在占位符）",
+          bool(poll_fn) and before != after and after and after[0].startswith("9.5"),
+          f"{before[:1]} → {after[:1]}；轮询耗时 {rec.get('last_ms', 0):.1f}ms"
+          f"（超 {MainWindow.SLOW_MS}ms 会自动降频到 {MainWindow.POLL_MS_BACKOFF}ms）")
+
     total = len(RESULTS)
     failed = [r for r in RESULTS if not r["ok"]]
     return {"total": total, "failed": len(failed), "ok": not failed,
