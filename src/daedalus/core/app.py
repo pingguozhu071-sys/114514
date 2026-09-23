@@ -329,8 +329,15 @@ class EngineApp:
                           queue_depths={k.split("{")[0].replace("queue.depth", "").strip("{}=")
                                         or "writer": v
                                         for k, v in METRICS.gauges("queue.depth").items()})
+        try:
+            tasks = self.drilldown.tasks_overview(limit=50)
+        except Exception as e:
+            logger.debug("任务列表读取失败：%s", e)
+            tasks = []
         return {"summary": s, "alerts": [{"key": a.key, "level": a.level, "message": a.message}
                                          for a in alarms],
+                # 给 GUI 任务表用（含 content_hash 指纹列 → 「指纹可见」）
+                "tasks": tasks,
                 "fetcher": self.fetcher.stats(), "frontier": self.frontier.stats(),
                 "writer": self.writer.stats(), "ledger": self.ledger.summary()}
 

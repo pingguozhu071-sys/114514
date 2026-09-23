@@ -97,9 +97,10 @@ def _tasks(window, tokens):
     cl = GlassCard.body(card, tokens)
     cl.addWidget(_label("任务下钻：每一行都能说清「看到了什么 → 决定了什么 → 为什么」", tokens))
     from PySide6.QtWidgets import QTableWidget
-    table = QTableWidget(0, 5, card)
+    # 指纹列（content_hash / simhash）是「指纹可见」在界面上的兑现：不用去翻库也能对上号
+    table = QTableWidget(0, 6, card)
     table.setObjectName("taskTable")
-    table.setHorizontalHeaderLabels(["状态", "目标", "尝试/限流/转移", "证据", "字节"])
+    table.setHorizontalHeaderLabels(["状态", "目标", "尝试/限流/转移", "证据", "指纹", "字节"])
     table.setStyleSheet("background: transparent; border: none;")
     table.verticalHeader().setVisible(False)
     table.horizontalHeader().setStretchLastSection(True)

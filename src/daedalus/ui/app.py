@@ -227,7 +227,7 @@ class MainWindow:
 
     @staticmethod
     def refresh_pages(win, metrics: dict | None = None) -> dict:
-        """把最新指标刷进概览/任务页（引擎没跑就清空显示）。"""
+        """把最新指标刷进概览页；顺带把任务表填上（含**指纹列**）。"""
         info = win._ui                                  # noqa: SLF001
         pages = info["pages"]
         m = dict(metrics or {})
@@ -240,6 +240,8 @@ class MainWindow:
             StatCard.set_value(cards[2], f"{int(s.get('tasks_done', 0))}/"
                                         f"{int(s.get('tasks_failed', 0))}")
             StatCard.set_value(cards[3], f"{s.get('net_latency_p95', 0) * 1000:.0f} ms")
+        EngineApp_ = None
+        _fill_task_table(win, m.get("tasks") or [])
         return s
 
     @staticmethod
@@ -251,6 +253,35 @@ class MainWindow:
                 "scheduler": st, "wallpaper_meta": dict(info["state"].get("wallpaper_meta") or {}),
                 "size": [win.width(), win.height()],
                 "signature_visible": bool(info["sig"].isVisible())}
+
+
+def _fill_task_table(win, rows: list) -> None:
+    """填任务表（含**指纹列**）。行数有界（只显示最近 N 条），控件树不重建。
+
+    放在类**外面**：它是模块级辅助函数，插进类中间会把后面 `@staticmethod` 的方法
+    吞进它的函数体里（S10 门禁 B3 当场报 `MainWindow has no attribute 'stats'`）。
+    """
+    try:
+        table = getattr(win._ui["pages"]["tasks"], "_table", None)     # noqa: SLF001
+        if table is None:
+            return
+        rows = list(rows)[:200]
+        table.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            fp = str(r.get("content_hash") or "")
+            values = [str(r.get("state") or ""), str(r.get("target") or "")[:80],
+                      f"{r.get('attempts', 0)}/{r.get('throttles', 0)}/{r.get('transitions', 0)}",
+                      str(r.get("evidence_n", 0)), fp[:16] or "—", str(r.get("bytes_done", 0))]
+            from PySide6.QtWidgets import QTableWidgetItem
+            for c, v in enumerate(values):
+                item = QTableWidgetItem(v)
+                if table.item(i, c) is None:
+                    table.setItem(i, c, item)          # 只在空位新建控件（不重建）
+                else:
+                    table.item(i, c).setText(v)        # 有就改文本
+        table.resizeColumnsToContents()
+    except Exception as e:
+        logger.debug("任务表刷新失败：%s", e)
 
 
 def _nav_style(tokens, object_name: str) -> str:

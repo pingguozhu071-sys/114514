@@ -110,6 +110,13 @@ class Drilldown:
             "SELECT sha256, url, size, mime, status, source, parent_task, path, note, "
             "fetched_at FROM raw_artifacts ORDER BY fetched_at LIMIT ?", (lim,)).fetchall()])
 
+    def _rows_pages_export(self, lim: int) -> list[dict]:
+        """派生层导出（含指纹）：**指纹可见**的兑现点之一。"""
+        return self._one(lambda c: [dict(r) for r in c.execute(
+            "SELECT url_hash, url, status, content_hash, simhash, duplicate_of, size, "
+            "source_sha256, fetched_at FROM pages ORDER BY fetched_at DESC LIMIT ?",
+            (lim,)).fetchall()])
+
     def _has_table(self, name: str) -> bool:
         try:
             return bool(self._one(lambda c: c.execute(
@@ -195,12 +202,19 @@ class Drilldown:
         return counts
 
     def export_jsonl(self, *, limit: int = 10000) -> str:
-        """全量导出（JSONL：一行一条，可 diff / 可 jq / 可回归对比）。"""
+        """全量导出（JSONL：一行一条，可 diff / 可 jq / 可回归对比）。
+
+        包含 `page` 行（带 **content_hash / simhash**）——这是「指纹可见」的落地：
+        导出的东西必须能自证"这条记录是谁"，否则离线核对时无从比对。
+        """
         lim = max(1, min(int(limit), 50000))
         out: list[str] = [json.dumps({"kind": "ledger", "counts": self.ledger_counts()},
                                      ensure_ascii=False, sort_keys=True)]
         for t in self.tasks_overview(limit=lim):
             out.append(json.dumps({"kind": "task", **t}, ensure_ascii=False, sort_keys=True,
+                                  default=str))
+        for pg in self._rows_pages_export(lim):
+            out.append(json.dumps({"kind": "page", **pg}, ensure_ascii=False, sort_keys=True,
                                   default=str))
         for a in self._rows_artifacts_export(lim):
             out.append(json.dumps({"kind": "artifact", **a}, ensure_ascii=False, sort_keys=True,
