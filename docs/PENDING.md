@@ -103,6 +103,20 @@
 | P53 | **`docs/10` 检测清单执行结果** | 进行中 | 逐项 PASS/FAIL/未验证 见 `docs/10-完工检测清单-执行结果.md` |
 | P32 | 中文引号统一为「」（软规则：281 处，全在注释/文案） | 未完成 | 不影响功能与门禁（软规则不改退出码）；`python tools/lint.py --all` 可查 |
 
+## 三·七、安全审计（自审，2026-09-23）—— **已完成，5 修 1 记**
+
+| # | 事项 | 状态 | 证据 |
+|---|---|---|---|
+| P54 | 安全自审探针（28 项对抗性电池：入网闸/逐跳/脱敏/检索注入/路径穿越/子进程/上限/压缩炸弹） | **已完成** | `tools/security_probe.py`（28/28）；`docs/17-安全审计（自审）.md` |
+| P55 | **凭据不可关**（原来关掉两个开关就能让 token 明文进日志——红线被做成了选项） | **已修** | `sanitize_credentials()` 不吃开关；门禁 S1 **C2b** |
+| P56 | `sanitize_url` 三类缺口：userinfo（Basic Auth 口令）/ 分号参数 / fragment 参数 + OAuth `code=` | **已修** | 探针逐形态验证；不误伤正常参数、不吃后续正文 |
+| P57 | 文本里的 header 转储（`Authorization: Bearer X`）与键名凭据字段（`cookie=/token=`）不脱敏 | **已修** | `sanitize_credentials` + `_SECRET_KEYS` 整子树抹掉 |
+| P58 | 浏览器槽位**只记账不强制**（并发 observe 能无限开上下文） | **已修** | `BoundedSemaphore` 非阻塞；门禁 S8 **D4** |
+| P59 | 卸载器 `%TEMP%\…bat` 后执行（NSIS 延迟扫尾） | **记录不修**（有意取舍） | 理由见 `docs/17` §四：每用户私有 temp + 先截断再写 + 替代方案会留残骸 |
+| P60 | 界面性能探针在机器忙时测不准（会把"机器忙"误读成"性能回归"） | **已修** | 探针输出 `machine_load_pct` / `measurement_trustworthy`；门禁据此 SKIP |
+| P61 | **依赖供应链 CVE 扫描**（PySide6/numpy/opencv/playwright/psutil/qfluentwidgets） | **未做** | 需 `pip-audit` 或 OSV-Scanner（要联网）；本机自审未覆盖 |
+| P62 | 二进制产物完整性（EXE/DLL 是否被篡改）+ fuzzing 原生解析器 | **未做** | 需签名/SBOM 工具链与专门 fuzzing；已在 `docs/17` §五 登记 |
+
 ## 四、可选 / 环境相关（已知缺失，不阻塞）
 
 | # | 事项 | 现状 | 备注 |
