@@ -78,6 +78,31 @@
 | P19 | **24h 长跑未执行** | 未验证（需机主点头） | 已有 1h 档（`python tools/soak.py --minutes 60`）；24h 需机主决定何时跑 |
 | P32 | 中文引号统一为「」（纯风格，`tools/lint.py` 的 `cjk-quote` 软提示） | 未完成（约 190 处，全在注释/文案里） | 不影响功能与门禁（软规则，退出码不受影响）；顺手改即可，见 `python tools/lint.py --all` |
 
+## 三·五、S10 GUI 与跨机打包 —— **已完成（2026-09-23）**
+
+| # | 事项 | 状态 | 证据 |
+|---|---|---|---|
+| P42 | GUI 设计系统全规格（三层材质/强调色/底图管线/渲染调度/性能红线） | **已完成** | `src/daedalus/ui/*`；`s10_gate.py` 21/21；`tools/perf_probe.py` 四项红线实测通过 |
+| P43 | PyInstaller 打包（one-dir + 双 EXE + 版本资源 + 图标） | **已完成** | `packaging/daedalus.spec`；产物 `dist/daedalus/`（413MB）；打包态 CLI 冒烟通过 |
+| P44 | 自制 NSIS 安装向导 + 卸载向导（不静默 / `un.` 前缀 / 条件化清理 / 数据保留 / DPI / 三语言） | **已完成** | `packaging/installer.nsi`（0 警告编译）；`s10b_gate.py` 20/20；产物 `Daedalus-Setup-0.1.0.dev0.exe` |
+| P45 | 版本号单一来源四件套校验 | **已完成** | `tools/version_check.py`（含全仓硬编码扫描）；门禁 A1/A2/B4 |
+| P46 | **中文全文检索（FTS5 + 预分词）** | **已完成（清单 G5 驱动）** | 迁移 0002 + `store/search.py` + CLI `search`；门禁 S3 F1 |
+| P47 | **每线程独立会话**（出网层不共享会话对象、无共享连接池） | **已完成（清单 I1 驱动）** | `net/ssrf_gate.py` 的 `_opener_for_thread()`；门禁 S1 H1 |
+| P48 | **静态基线与覆盖率工具**（只报告不设阈值；只降不升） | **已完成（清单 O4 驱动）** | `tools/baseline.py` + `docs/16-静态基线与覆盖率.json`（覆盖率 68.05% 估计值；lint 硬拦 0） |
+| P49 | **仓库零提交**（计划里「一修复=一 commit」从未执行） | **已修（2026-09-23）** | 首个提交 `fa08f7d`（130 文件/24526 行）；自该提交起每次修复单独提交 |
+| P50 | **打包态 GBK 控制台编码崩溃** | **已修（打包冒烟发现）** | `cli._make_output_safe()` + ASCII 标记；门禁 S9 F3 |
+| P51 | NSIS 脚本 BOM / MUI 宏顺序 / 悬空 File 指令 | **已修** | `tools/build.py` 的 `_ensure_bom()`；`installer.nsi` 0 警告 |
+| P52 | **边界自证：playwright 必须是未改装的正版** | **已完成** | `env/browser.py` 的 `_playwright_is_genuine()`（本机同装 patchright，未被劫持但需防静默替换）；门禁 S8 D3 |
+| P20 | 未装过的新机器上安装未验证 | 未验证 | 已能编译安装器、通过全部静态门禁；真机安装需一台干净机器/干净账户 |
+| P19 | 24h 长跑未执行 | 未验证 | 1h 档命令就绪（`python tools/soak.py --minutes 60`） |
+
+## 三·六、名单外的纪律缺口（如实登记）
+
+| # | 事项 | 状态 | 说明 |
+|---|---|---|---|
+| P53 | **`docs/10` 检测清单执行结果** | 进行中 | 逐项 PASS/FAIL/未验证 见 `docs/10-完工检测清单-执行结果.md` |
+| P32 | 中文引号统一为「」（软规则：281 处，全在注释/文案） | 未完成 | 不影响功能与门禁（软规则不改退出码）；`python tools/lint.py --all` 可查 |
+
 ## 四、可选 / 环境相关（已知缺失，不阻塞）
 
 | # | 事项 | 现状 | 备注 |
