@@ -12,6 +12,17 @@
     icon_full.ico            全部尺寸都用全身（备选）
     icon_bust.ico            全部尺寸都用胸像（备选）
 
+颜色纪律（**不要删**：这四行是 R/B 事故的防线）
+    1) **`cv2.imencode` 期望的就是 BGRA**（它自己会按 PNG 规范落成 RGB 存储）。
+       所以编码前**绝对不许**再套一层 `cvtColor(BGRA2RGBA)`——那是「换了两次」，
+       落盘的每张 PNG/ICO 都变成原画的 **R↔B 镜像**（2026-09-23 用户投诉「图标颜色不对」的真凶）。
+       所有 PNG 写出都必须走下面的 `_png_bytes`。
+    2) **写盘后必须读回自证**：`imwrite_u` 与 `write_ico` 写完都会解码回来与自己逐元素比对，
+       不一致直接 `SystemExit`——这类「编码顺序」事故只在落盘那一刻发生，读回来一比就现形。
+    3) `DARK_BG` 的元组是 **BGR** 顺序：#0E1620 要写成 `(32, 22, 14)`（写成 `(14, 22, 32)`
+       得到的是 #20160E 褐黑，和 `docs/13-图标与美术.md` 记的规格不符）。
+    4) 独立门禁：`python tools/icon_check.py`（源图 ↔ 抠图 ↔ 各尺寸产物的**色向契约**）。
+
 为什么这么抠（而不是一键抠图库）
     1) 背景是"近纯白 + 浅灰网格/标注/水印 + 柔和投影"：先用**边界像素建背景色模型**（Lab 空间、
        按通道标准差归一化），比"矩形框丢给 GrabCut"稳得多——标注文字和网格线不会被当成主体。
@@ -44,8 +55,11 @@ WORK_MAX_SIDE = 1400
 ICO_SIZES = (16, 24, 32, 48, 64, 128, 256)
 # 小尺寸用胸像：16–48px 下全身立绘是糊的，而且胸像区域完全没有背景残留（最干净）
 SMALL_SIZES = (16, 24, 32, 48)
-DARK_BG = (14, 22, 32)              # 备用深色底（BGR）
+DARK_BG = (32, 22, 14)              # 深色圆角底（**BGR**，即 #0E1620，规格见 docs/13）
 MARGIN = 0.07                       # 图标留白比例
+
+# 写盘后的读回自证计数（main 收尾打印，作为「这一轮真的比过」的凭据）
+_SELF_CHECK = {"png": 0, "ico": 0}
 
 
 def cutout_rembg(img: np.ndarray, model: str = "isnet-anime",
@@ -76,6 +90,21 @@ def cutout_rembg(img: np.ndarray, model: str = "isnet-anime",
     return rgba                                       # cv2 解码 PNG 得到的是 BGRA
 
 
+def _png_bytes(bgra: np.ndarray, *, ctx: str) -> bytes:
+    """BGRA 数组 → PNG 字节。**唯一的 PNG 编码出口**。
+
+    `cv2.imencode` 期望的输入顺序就是 **BGRA**（它自己会按 PNG 规范把像素落成 RGB 存储）。
+    所以这里**不许**再套 `cv2.cvtColor(..., cv2.COLOR_BGRA2RGBA)`：那等于连换两次，
+    落盘的每张 PNG/ICO 都会变成原画的 **R↔B 镜像**——这就是 2026-09-23 用户投诉
+    「图标颜色不对」的真凶（`assets/*.png` / `assets/*.ico` / 安装器美术的 Logo 全被传染）。
+    守这条纪律的三道防线：本函数的这句注释、调用方的**读回自证**、`tools/icon_check.py` 的色向门禁。
+    """
+    ok, buf = cv2.imencode(".png", bgra)
+    if not ok:
+        raise SystemExit(f"[_png_bytes] PNG 编码失败：{ctx}")
+    return buf.tobytes()
+
+
 def load_image(path: str) -> np.ndarray:
     """中文/空格路径安全读图（cv2.imread 不支持 Unicode 路径，会静默返回 None）。"""
     buf = np.fromfile(str(path), dtype=np.uint8)
@@ -85,18 +114,33 @@ def load_image(path: str) -> np.ndarray:
     return img
 
 
+def load_png_u(path: pathlib.Path) -> np.ndarray:
+    """中文/空格路径安全读图（保留 alpha 通道）——读回自证用。"""
+    img = cv2.imdecode(np.fromfile(str(path), dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise SystemExit(f"读回失败（文件不存在或不是图）：{path}")
+    return img
+
+
 def imwrite_u(path: pathlib.Path, bgra: np.ndarray) -> None:
-    """中文/空格路径安全写图。
+    """中文/空格路径安全写图 + **写盘后读回自证**。
 
     ⚠️ **不要用 cv2.imwrite**：它在 Windows 上走 ANSI API，路径含中文时**静默失败**
     （返回 False 不抛异常，文件根本不出现）。本工具第一版就踩了这个坑——
     `assets/` 的路径里有中文，四张 PNG 一张都没写出来，而 ICO 写成了（那是 Python 的文件 I/O）。
+
+    ⚠️ **编码顺序**：一律走 `_png_bytes`（它内部才有 imencode，且不带多余的 cvtColor）。
+    写完立刻解码回来逐元素比对（PNG 无损 → 容差 0）：R/B 互换、通道数错、写到一半，
+    这三类都会在下面这一比里当场暴露，而不是等用户看见「颜色不对」。
     """
-    ok, buf = cv2.imencode(".png", cv2.cvtColor(bgra, cv2.COLOR_BGRA2RGBA))
-    if not ok:
-        raise SystemExit(f"PNG 编码失败：{path}")
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(buf.tobytes())
+    path.write_bytes(_png_bytes(bgra, ctx=str(path)))
+    back = load_png_u(path)
+    if back.shape != bgra.shape or not np.array_equal(back, bgra):
+        raise SystemExit(
+            f"[imwrite_u] 读回自证失败：{path}（写入 {bgra.shape}，读回 {back.shape}）。"
+            f"写进去和读回来必须逐元素一致，不许有差。")
+    _SELF_CHECK["png"] += 1
 
 
 def resize_rgba(img: np.ndarray, size: int) -> np.ndarray:
@@ -308,14 +352,41 @@ def compose_dark(rgba: np.ndarray, size: int) -> np.ndarray:
     return canvas
 
 
+def read_ico(path: pathlib.Path) -> list[tuple[int, np.ndarray]]:
+    """把 ICO 容器解析回来：[(尺寸, 解码后的 BGRA 数组)]（读回自证与 `tools/icon_check.py` 共用）。"""
+    raw = path.read_bytes()
+    if len(raw) < 6:
+        raise SystemExit(f"[ico] 文件太短，不是 ICO：{path}")
+    reserved, kind, count = struct.unpack("<HHH", raw[:6])
+    if (reserved, kind) != (0, 1):
+        raise SystemExit(f"[ico] 头部应为 (0, 1)，实为 ({reserved}, {kind})：{path}")
+    out: list[tuple[int, np.ndarray]] = []
+    for i in range(count):
+        entry = raw[6 + 16 * i: 22 + 16 * i]
+        if len(entry) != 16:
+            raise SystemExit(f"[ico] 目录项 {i} 不完整：{path}")
+        w_b, h_b, _colors, _rsv, _planes, _bpp, nbytes, off = struct.unpack("<BBBBHHII", entry)
+        size = 256 if w_b == 0 else w_b
+        blob = raw[off:off + nbytes]
+        if len(blob) != nbytes or not blob.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise SystemExit(f"[ico] 第 {i} 项不是完整的 PNG 数据（size={size}）：{path}")
+        arr = cv2.imdecode(np.frombuffer(blob, np.uint8), cv2.IMREAD_UNCHANGED)
+        if arr is None or arr.ndim != 3 or arr.shape[2] != 4:
+            raise SystemExit(f"[ico] 第 {i} 项解不出 BGRA（size={size}，h_b={h_b}）：{path}")
+        out.append((size, arr))
+    return out
+
+
 def write_ico(entries: list[tuple[int, np.ndarray]], path: pathlib.Path) -> None:
-    """手写 ICO 容器，每个尺寸内嵌 PNG（Vista+ 支持）。这样每个尺寸都能单独控制重采样。"""
+    """手写 ICO 容器，每个尺寸内嵌 PNG（Vista+ 支持）。这样每个尺寸都能单独控制重采样。
+
+    ⚠️ 内嵌 PNG 一律走 `_png_bytes`（不要再叠 cvtColor，见其注释）。
+    **写完立刻读回自证**：重新解析容器 → 逐项解码 → 与编码前的数组逐元素比对（PNG 无损 → 容差 0）。
+    这样「某一档尺寸颜色被翻过」（R/B 互换那类）不可能悄悄留在 assets/ 里。
+    """
     blobs = []
     for size, rgba in entries:
-        ok, buf = cv2.imencode(".png", cv2.cvtColor(rgba, cv2.COLOR_BGRA2RGBA))
-        if not ok:
-            raise SystemExit(f"PNG 编码失败：size={size}")
-        blobs.append((size, buf.tobytes()))
+        blobs.append((size, _png_bytes(rgba, ctx=f"size={size}")))
     n = len(blobs)
     header = struct.pack("<HHH", 0, 1, n)
     offset = 6 + 16 * n
@@ -325,6 +396,19 @@ def write_ico(entries: list[tuple[int, np.ndarray]], path: pathlib.Path) -> None
         dirs += struct.pack("<BBBBHHII", dim, dim, 0, 0, 1, 32, len(blob), offset + len(data))
         data += blob
     path.write_bytes(header + dirs + data)
+
+    back = read_ico(path)
+    if len(back) != n:
+        raise SystemExit(f"[write_ico] 读回自证失败：项数 {len(back)} ≠ 写入 {n}（{path}）")
+    for (size_w, arr_w), (size_r, arr_r) in zip(entries, back):
+        if size_r != size_w:
+            raise SystemExit(f"[write_ico] 读回自证失败：读回尺寸 {size_r} ≠ 写入 {size_w}（{path}）")
+        if arr_r.shape != arr_w.shape or not np.array_equal(arr_r, arr_w):
+            raise SystemExit(
+                f"[write_ico] 读回自证失败：{path} 第 {size_w}px 项与自己编码前不一致"
+                f"（写入 {arr_w.shape} / 读回 {arr_r.shape}）。")
+    _SELF_CHECK["ico"] += n
+    print(f"[ico] {path.name} 读回自证：{n}/{n} 项逐元素一致（{', '.join(str(s) for s, _ in entries)}）")
 
 
 def finialize_mask(mask: np.ndarray, k_ratio: float = 0.008,
@@ -514,8 +598,11 @@ def main() -> int:
               f"{info['dark_thick_ratio'] * 100:.1f}% / {info['colored_ratio'] * 100:.1f}%"
               f"   背景（泛洪可达）: {info['outside_ratio'] * 100:.1f}%")
     print(f"工作分辨率: {info['work_size']}")
+    print(f"读回自证  : PNG {_SELF_CHECK['png']} 张 + ICO 内嵌 {_SELF_CHECK['ico']} 张，"
+          f"全部逐元素一致（R/B 互换这类编码事故的当场防线）")
     print(f"输出      : {', '.join(sorted(p.name for p in out.glob('*')))}")
-    print("─" * 66)
+    print("─" * 66 + "\n"
+          f"下一步     : python tools/icon_check.py   # 颜色契约门禁（源图 ↔ 抠图 ↔ 各尺寸产物）")
     return 0
 
 
