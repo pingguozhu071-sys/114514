@@ -1,0 +1,95 @@
+﻿07 · Capability Boundaries (what we do / what we do not do)
+
+
+  This document doubles as **the license text in the installer** (generated from this file by
+  `tools/build.py` into `packaging/art/license_zh.txt` — one single source, never hand-copied).
+  So editing it here directly changes the boundary statement a user sees while installing.
+
+In one sentence
+
+
+Collect only by **lawful, observable** means: make "what I can see" as strong as it can go,
+and never do "what I must break through".
+
+Do (compliance robustness, pushed as far as it goes)
+
+
+  **Honest identity**: a UA that states its purpose is sent by default
+  (`Daedalus/<version> (personal data collector; ...)`); no browser-fingerprint spoofing, no
+  forged Referer.
+  **Politeness first**: per-domain rate limiting + a concurrency cap + an atomically reserved
+  politeness interval; `Retry-After` wins and is **capped** (300s by default); domain cooldowns
+  **survive restarts** (a restart does not make us forget that a site is resting).
+  **robots rules**: enforced with RFC 9309 semantics (404/4xx → treated as absent;
+  5xx/unreachable → treated as **fully disallowed**; longest match wins, Allow wins ties;
+  cache ≤24h).
+  **Session reuse**: cookies (Netscape / JSON / browser export) → a session jar, kept on disk as
+  DPAPI ciphertext, for sessions **you are entitled to access**.
+  **Unmodified browser**: a real browser visits public pages and does **network observation**
+  (three layers of slots — process / context / page — with per-subresource decisions), used for
+  pages whose content is an empty shell — and for nothing beyond that.
+  **Block detection and handling**: it can state **where** we were blocked and **why** (status
+  code, `Retry-After`, the blocked URL and the reason all land in the fact layer), then
+  **graded backoff → slow down → stop → report → abandon that site with a recorded reason**.
+  **Authorized targets get full strength**: for **your own sites, a partner's authorized scope,
+  official APIs**, concurrency and intensity can go up to whatever the resource plan allows.
+
+Do not (defeating the other side's protections; the architecture leaves no room for it)
+
+
+  injection to hide automation / fingerprint spoofing / rewriting `navigator.webdriver`;
+  solving verification challenges or integrating with solving services;
+  forging request signatures (the risk-control signature algorithms of various sites);
+  egress IP rotation, proxy pools, account pools;
+  imitating human behaviour (mimicking human pacing / mouse trajectories to evade risk control);
+  any technical means of bypassing logins, paywalls, access control or rate limits.
+
+**Why we do not do these** (three reasons, any one of which stands on its own):
+
+1. **It crosses a red line this project wrote itself**: three design documents, clause C4 of《02》,
+   and a boundary the owner explicitly confirmed all list "do not defeat the other side's
+   protections" as non-negotiable. Architecturally there are exactly three experts at the top
+   level (direct network / browser runtime / artifacts and media) and no place at all for
+   "adversarial" behaviour.
+2. **Such capabilities cannot prove themselves effective**: Kiana's own failure log says "no
+   quantitative evidence, cannot be tested offline". Shipping them would mean claiming they
+   work, while the project can produce no acceptance criterion — that is dressing "unverified"
+   up as "implemented".
+3. **Cost and benefit are asymmetric**: to slip past one site's risk control you must maintain a
+   whole implementation that goes stale as the target changes, and this project's legitimate
+   uses (owned / authorized / public data) do not need it at all.
+
+What to do when blocked (this is the real answer in this project)
+
+
+| Symptom | Handling | What you can see |
+|---|---|---|
+| 429 / 503 / `Retry-After` | **No retry, no IP change**: an independent counter plus cooldown and backoff; after N consecutive hits the item goes to the dead-letter queue | `net.throttled`, the `throttles` counter, a ledger entry, an alert |
+| robots disallows | rejected before enqueueing (`policy_denied`), zero egress | task state `policy_denied` + a readable reason |
+| SSRF gate blocks (private/reserved address) | not retryable, stop immediately | `policy_denied` in the evidence + the exact address |
+| Content is always an empty shell / verification page | record a `browser` candidate or reject on quality, **never escalate to adversarial means** | quality score and reason, browser-candidate evidence |
+| A site rejects us entirely | stop for that site, write down the reason, move to the next target | ledger `policy_denied`, exportable for audit |
+
+Environment variables and switches (the lawful form of working around things)
+
+
+  **Proxies are read from environment variables only** (`HTTP_PROXY` / `HTTPS_PROXY` /
+  `ALL_PROXY`): there is no interface for "just type in some proxy", and no rotation either.
+  **Pluggable rather than reshaped**: any **lawful** new acquisition method (official API,
+  licensed data source, self-hosted proxy, external tool) can be plugged in as an adapter or an
+  execution resource — adding a source = adding a file; the core is never reshaped for
+  adversarial means.
+  `respect_robots` can be turned off (the config key exists), but **think it through before
+  turning it off**: that is your own compliance red line and the engine will not judge it for
+  you. There is no CLI switch for it — precisely so that this does not become convenient.
+
+What you are responsible for (stated plainly, no hedging)
+
+
+  The targets you collect must be ones **you are entitled to access**; this project does not
+  judge authorization for you, and provides no means of bypassing it.
+  The data you collect is yours to handle (the on-machine redaction switch only affects
+  **display and export**; **the raw layer is never redacted** — redact it and it can no longer
+  be replayed, which is the same as destroying the facts).
+  The uninstaller **does not delete your data**; deleting it is a separate, explicitly ticked
+  action.

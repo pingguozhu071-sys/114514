@@ -8,6 +8,10 @@
 ;  另有一条机主硬要求：**卸载时保留用户数据**，并在界面上明说"您的数据不会被删除"。
 ;
 ;  编码：本文件保存为 **UTF-8 with BOM**（NSIS 3 认 BOM；否则中文全乱码）。
+;  **许可页的三份文本也必须带 BOM**：`LicenseData` 对无 BOM 的文件按**本机 ANSI 代码页**
+;  （简体中文机器上是 936/GBK）解码 —— 一份 UTF-8 无 BOM 的中文许可，到了安装向导里就是
+;  满屏乱码生僻字（真实投诉）。三份文本由 packaging/make_installer_art.py 生成（带 BOM），
+;  tools/build.py 在调 makensis 之前会**硬断言**每个文件的前 3 字节是 EF BB BF。
 ;  编译：由 tools/build.py 用 python subprocess 调 makensis（Git Bash 会把 /S 当路径改写）。
 ;  ─────────────────────────────────────────────────────────────────────
 
@@ -65,8 +69,10 @@ VIAddVersionKey "LegalCopyright" ""
 !insertmacro MUI_PAGE_WELCOME
 
 !define MUI_LICENSEPAGE_TEXT_TOP "先看一眼使用边界（不长，但请真的看一眼）："
-; 许可页内容由 tools/build.py 从 docs/07-能力边界.md **生成**（单一来源，不手抄两份）
-!insertmacro MUI_PAGE_LICENSE "art\license.txt"
+; 许可页内容**按界面语言选文件**（MUI2 官方做法：`LicenseLangString` + `$(MUILicense)`）。
+; 为什么不是一份文件：三语共用一份中文文本 = 日/英用户看不懂（而 `LicenseData` 只吃一份文件）。
+; 三份文本的来源与编码见文件开头；语言串本身定义在下面 `MUI_LANGUAGE` 之后（顺序有讲究）。
+!insertmacro MUI_PAGE_LICENSE "$(MUILicense)"
 
 !define MUI_COMPONENTSPAGE_SMALLDESC
 !insertmacro MUI_PAGE_COMPONENTS
@@ -95,6 +101,16 @@ VIAddVersionKey "LegalCopyright" ""
 !insertmacro MUI_LANGUAGE "Japanese"
 !insertmacro MUI_LANGUAGE "English"
 
+; ── 许可文本的语言串（**必须放在 MUI_LANGUAGE 之后**，这一步实测过才敢这么写）──
+; 顺序是死的：`MUI_PAGE_*` 必须在 `MUI_LANGUAGE` 之前，而 `${LANG_SIMPCHINESE}` 这类常量要等
+; 语言表载入后才存在 → 唯一的合法顺序是：页面宏 → MUI_LANGUAGE → LicenseLangString。
+; 顺序放错的症状（实测）：`${LANG_*}` 报 7025「not a valid language id, using 1033」，
+; 三行全部塌到英语 1033，再报 6040「LangString 未在 ja/zh 语言表里设置」——**编译仍会成功**，
+; 只有警告在提醒你：日/中文用户会看到英文。所以 `makensis` 的警告数必须为 0（见门禁）。
+LicenseLangString MUILicense ${LANG_SIMPCHINESE} "art\license_zh.txt"
+LicenseLangString MUILicense ${LANG_JAPANESE}    "art\license_ja.txt"
+LicenseLangString MUILicense ${LANG_ENGLISH}     "art\license_en.txt"
+
 ; ══════════════════════════════════════════════════════════════════
 ;  安装
 ; ══════════════════════════════════════════════════════════════════
@@ -115,7 +131,14 @@ Section "!核心程序（必需）" SEC_CORE
     SetOutPath "$INSTDIR"
     ; 程序本体（dist\daedalus 整目录：两个 exe + _internal）
     File /r "..\dist\daedalus\*.*"
-    File "art\license.txt"
+    ; 许可文本：**三份都装**（每份都是 UTF-8 with BOM，见文件开头）。
+    ; 为什么不分语言只装一份：安装目录可能被交接给别人、界面语言也可能事后改（marker 里的
+    ; lang= 可以改），三份都在原地最不糊涂；三份加起来不到 20 KB，不值得为省这点体积加一个分支。
+    ; 其中中文那份**是权威源**（由 docs/07-能力边界.md 生成），日/英是它的忠实翻译——
+    ; 译文与原文并排放着，读者随时能自己核对。
+    File /oname=LICENSE-zh.txt "art\license_zh.txt"
+    File /oname=LICENSE-ja.txt "art\license_ja.txt"
+    File /oname=LICENSE-en.txt "art\license_en.txt"
 
     ; 登记安装的凭据：卸载时靠它判断"这是我们装的"；**同时记下安装时选的语言**，
     ; 程序启动时读它决定界面语言（顺序：用户设置 > 这里 > 系统 UI 语言 > en-US）。
@@ -126,12 +149,8 @@ Section "!核心程序（必需）" SEC_CORE
     FileWrite $0 "exe=${APP_EXE}$\r$\n"
     FileWrite $0 "lang=$LANGUAGE$\r$\n"
     FileClose $0
-
-    ; 开始菜单 + 桌面快捷方式（共享资源：卸载时按登记条件化清理）
-    CreateDirectory "$SMPROGRAMS\Daedalus"
-    CreateShortcut "$SMPROGRAMS\Daedalus\${APP_NAME_ZH}.lnk" "$INSTDIR\${APP_EXE}" "" "$INSTDIR\${APP_EXE}" 0
-    CreateShortcut "$SMPROGRAMS\Daedalus\命令行采集（CLI）.lnk" "$INSTDIR\${APP_CLI}" "" "$INSTDIR\${APP_CLI}" 0
-    CreateShortcut "$SMPROGRAMS\Daedalus\卸载 ${APP_NAME_ZH}.lnk" "$INSTDIR\un.${APP_NAME}.exe"
+    ; 快捷方式不在这里建：开始菜单那条（可取消勾选）在 SEC_SHORTCUTS，桌面那条（默认不勾）在
+    ; SEC_DESKTOP，各自把「我建了什么」登记进 marker。共享资源的创建与登记放在一起，卸载才敢按登记删。
 
     ; 注册表：卸载信息（控制面板能看到、能卸）
     WriteRegStr HKLM "${APP_REGKEY}" "DisplayName" "${APP_NAME_ZH}（${APP_NAME}）"
@@ -161,13 +180,55 @@ Section /o "可选：把浏览器运行时也带上（约 +400MB，装完就能�
 SectionEnd
 
 Section "开始菜单快捷方式" SEC_SHORTCUTS
-SectionIn RO
+    ; 这一段**真的创建**那三个开始菜单入口。之前它是个空壳（`SectionIn RO` + 空段体）：永远勾选、
+    ; 不可取消、什么都不做 —— 组件页上放着「勾了等于没勾」的条目，等于骗用户。
+    ; 现在不写 `SectionIn RO`、也不写 `/o`：**默认勾选、但用户可以取消**（这才是组件页该有的语义）。
+    ; 取消勾选后，卸载时那几个 Delete / RMDir 落在不存在的文件与目录上（空操作），不会误删别人。
+    ; 上下文：**当前用户**（`$SMPROGRAMS` 的默认上下文）—— 与本次改动前一致，语义没换。
+    CreateDirectory "$SMPROGRAMS\Daedalus"
+    CreateShortcut "$SMPROGRAMS\Daedalus\${APP_NAME_ZH}.lnk" "$INSTDIR\${APP_EXE}" "" "$INSTDIR\${APP_EXE}" 0
+    CreateShortcut "$SMPROGRAMS\Daedalus\命令行采集（CLI）.lnk" "$INSTDIR\${APP_CLI}" "" "$INSTDIR\${APP_CLI}" 0
+    CreateShortcut "$SMPROGRAMS\Daedalus\卸载 ${APP_NAME_ZH}.lnk" "$INSTDIR\un.${APP_NAME}.exe"
+SectionEnd
+
+Section /o "创建桌面快捷方式" SEC_DESKTOP
+    ; `/o` = **默认不勾**：桌面是用户自己的地盘，本工程不静默动用户环境（与上面「可选：浏览器运行时」
+    ; 同一条纪律）。想要图标的人自己勾。
+    ;
+    ; 上下文选 `all`（公共桌面 `C:\Users\Public\Desktop`），不是在当前用户上下文里建。理由：
+    ;   本安装器是 `RequestExecutionLevel admin` 装到 Program Files（**机器级**安装），而 UAC 提权
+    ;   完全可能用的是**另一个管理员账号**的凭据 —— 那时 `current` 指的是那个管理员，快捷方式会落在
+    ;   **不是点安装的那个人**的桌面上，于是「勾了却没有图标」（这正是这次要修的投诉）。
+    ;   写公共桌面则**任何用户（含发起安装的那位）都能看见**，勾选这件事才真的算数。
+    ; 有意保留的不一致（本次不动的范围）：开始菜单那三个入口仍在 `current` 上下文 —— 换它的上下文
+    ;   会牵动卸载侧的删除目标，属于另一台手术；这里只把**新增**的桌面图标做对。
+    ; 卸载侧必须用同一个上下文（见 「un.程序文件」 段），否则删的是另一个位置。
+
+    ; 登记在先、创建在后：万一后面创建失败，卸载时只会去删一个不存在的 .lnk（空操作）；
+    ; 反过来（先创建后登记）一旦登记失败，公共桌面上就留一个**没人认领**的图标。
+    ; ⚠️ 追加时必须 `FileSeek $0 0 END`：实测 NSIS 的 `FileOpen ... a` **不是**从文件末尾写，
+    ;    而是从**偏移 0** 写（会直接覆盖 marker 头部）。marker 是卸载侧的凭据，毁了它等于卸载失灵。
+    ClearErrors
+    FileOpen $0 "$INSTDIR\${APP_MARKER}" a
+    IfErrors desk_marker_fail
+        FileSeek $0 0 END
+        FileWrite $0 "desktop_shortcut=1$\r$\n"
+        FileClose $0
+        Goto desk_marker_done
+    desk_marker_fail:
+        DetailPrint "警告：没能把「桌面快捷方式」登记进 marker —— 卸载时将不会自动删除它。"
+    desk_marker_done:
+
+    SetShellVarContext all
+    CreateShortCut "$DESKTOP\${APP_NAME_ZH}.lnk" "$INSTDIR\${APP_EXE}" "" "$INSTDIR\${APP_EXE}" 0
+    SetShellVarContext current                  ; 立刻换回来，别影响后面的段
 SectionEnd
 
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
-    !insertmacro MUI_DESCRIPTION_TEXT ${SEC_CORE} "程序本体（两个可执行文件 + 依赖 + 文档）。"
+    !insertmacro MUI_DESCRIPTION_TEXT ${SEC_CORE} "程序本体（两个可执行文件 + 依赖 + 三份许可文本）。"
     !insertmacro MUI_DESCRIPTION_TEXT ${SEC_BROWSER} "浏览器运行时不随包分发；勾选只会记下意图并提示安装命令。"
-    !insertmacro MUI_DESCRIPTION_TEXT ${SEC_SHORTCUTS} "开始菜单里放一个入口。"
+    !insertmacro MUI_DESCRIPTION_TEXT ${SEC_SHORTCUTS} "开始菜单里放三个入口（程序 / CLI / 卸载）。取消勾选则不放。"
+    !insertmacro MUI_DESCRIPTION_TEXT ${SEC_DESKTOP} "在公共桌面放一个图标（所有用户都能看到；默认不勾）。"
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
 ; ══════════════════════════════════════════════════════════════════
@@ -186,10 +247,39 @@ Section "un.程序文件" UN_SEC_CORE
     ; 判据 = 我们登记安装时写下的 marker。**先读、再决定**，绝不在删除后才判断。
     IfFileExists "$INSTDIR\${APP_MARKER}" 0 un_not_ours
         ; 分支 A：是我们的登记安装 → 清掉我们装的东西
+        ; 开始菜单（当前用户上下文）：不按 marker 里的开关判定 —— 我们发过的每一个版本都在这个位置
+        ; 建过入口，若拿一个「新版本才会写」的开关去判，老安装升级上来的那批 .lnk 就永远没人删。
+        ; 用户若在组件页取消勾选，这里删的是不存在的文件/目录（空操作），不会误伤。
         Delete "$SMPROGRAMS\Daedalus\${APP_NAME_ZH}.lnk"
         Delete "$SMPROGRAMS\Daedalus\命令行采集（CLI）.lnk"
         Delete "$SMPROGRAMS\Daedalus\卸载 ${APP_NAME_ZH}.lnk"
-        RMDir "$SMPROGRAMS\Daedalus"
+        RMDir "$SMPROGRAMS\Daedalus"          ; 只在目录空时才删 → 用户自己放的东西不会被连坐
+
+        ; 桌面快捷方式（**公共**桌面）：**按 marker 条件化删除**（硬规矩 ③）。
+        ; 桌面是所有用户共享的位置，无条件删等于替别人做决定；而「我到底建没建」只有安装时知道，
+        ; 所以判据是安装时写下的 `desktop_shortcut=1`（见 SEC_DESKTOP）。
+        ; 上下文必须与创建时**一致**（all）—— 否则删的是另一个位置，公共桌面的图标会留下来。
+        StrCpy $2 0
+        ClearErrors
+        FileOpen $0 "$INSTDIR\${APP_MARKER}" r
+        IfErrors un_desktop_done
+        un_marker_loop:
+            FileRead $0 $1
+            StrCmp $1 "" un_marker_done
+            ; 实测 `FileRead` **连行尾 CRLF 一起返回**，所以两种写法各认一次（手改过 marker 也认）
+            StrCmp $1 "desktop_shortcut=1$\r$\n" 0 +2
+                StrCpy $2 1
+            StrCmp $1 "desktop_shortcut=1" 0 un_marker_loop
+                StrCpy $2 1
+            Goto un_marker_loop
+        un_marker_done:
+            FileClose $0
+        un_desktop_done:
+        StrCmp $2 1 0 un_no_desktop
+            SetShellVarContext all
+            Delete "$DESKTOP\${APP_NAME_ZH}.lnk"
+            SetShellVarContext current        ; 立刻换回当前用户上下文（上面的开始菜单项用的是它）
+        un_no_desktop:
         ; 备份"我们装了什么"的痕迹，供延迟扫尾判断（删除逻辑不依赖它）
         FileOpen $0 "$TEMP\daedalus_uninstall.flag" w
         FileWrite $0 "1"

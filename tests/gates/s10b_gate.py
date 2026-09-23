@@ -4,13 +4,17 @@
 覆盖（每条对应《06》的一个发版门槛）：
   A 版本单一来源   A1 四件套一致｜A2 无硬编码版本字面量｜A3 nsh 内容正确（含 VIProductVersion 数字版）
   B 安装向导       B1 **不静默**（拒绝 /S 且说明理由）｜B2 完整向导页齐全｜B3 DPI 感知｜
-                   B4 版本徽章来自 nsh｜B5 不代下载浏览器（只提示）｜B6 许可页文本由 07 生成
+                   B4 版本徽章来自 nsh｜B5 不代下载浏览器（只提示）｜B6 许可页文本由 07 生成｜
+                   B7 三份许可文本**字节级带 BOM**（无 BOM = 许可页乱码）｜B8 许可页按语言选文件
   C 卸载向导       C1 卸载段**全部**带 `un.` 前缀（漏了会在安装时执行）｜C2 延迟扫尾存在｜
-                   C3 条件化清理（判据 + 三分支互斥）｜C4 **数据默认保留**（删除数据是可选段且不强制）
+                   C3 条件化清理（判据 + 三分支互斥）｜C4 **数据默认保留**（删除数据是可选段且不强制）｜
+                   C5 桌面快捷方式：可选段创建 + 按 marker 条件化删除｜C6 `$DESKTOP` 真出现在指令里｜
+                   C7 开始菜单段**真的建**快捷方式（不是 RO + 空段体的假组件）
   D 数据根规则     D1 便携靠标记文件（无需环境变量）｜D2 安装态走用户目录｜D3 **绝不**用解包临时目录
   E 构建器         E1 dry-run 自证（零文件创建）｜E2 缺件硬报错｜E3 产物核对（必需在/禁止不在）｜
                    E4 解包核对无凭据特征
-  F 美术与文档     F1 安装器 BMP 尺寸符合 NSIS 规定｜F2 docs 00–09 齐备且有实质内容
+  F 美术与文档     F1 安装器 BMP 尺寸符合 NSIS 规定｜F2 docs 00–09 齐备且有实质内容｜
+                   F5 图标体检 tools/icon_check.py（存在即要求退出码 0；未写则 SKIP）
 
 跑法（离线；不起安装器、不动系统）：
     python tests/gates/s10b_gate.py     # 退出码 0 = 全通过
@@ -21,6 +25,7 @@ from __future__ import annotations
 import os
 import pathlib
 import re
+import subprocess
 import sys
 import tempfile
 
@@ -144,8 +149,68 @@ def t_license_from_docs():
     body = mod.license_text()
     assert len(body) > 400, f"许可文本太短：{len(body)}"
     assert "不绕过" in body or "验证码" in body, body[:200]
-    assert (ROOT / "packaging" / "art" / "license.txt").exists(), "未生成 art/license.txt"
-    return ok(f"由 docs/07-能力边界.md 生成 {len(body)} 字符；art/license.txt 已在")
+    assert (ROOT / "packaging" / "art" / "license_zh.txt").exists(), "未生成 art/license_zh.txt"
+    names = [n for n, _ in mod.license_files()]
+    assert names == ["license_zh.txt", "license_ja.txt", "license_en.txt"], names
+    return ok(f"由 docs/07-能力边界.md 生成 {len(body)} 字符；三份文件名 {names}（BOM 见 B7）")
+
+
+@case("B7 许可文本三份齐备、**字节级**带 BOM、且中文那份确实来自 docs/07")
+def t_license_bom():
+    """用户投诉的乱码根因：`art/license.txt` 是 **UTF-8 无 BOM**，而 NSIS 的 `LicenseData` 对无 BOM
+    文件按**本机 ANSI 代码页**（简体中文机器 936/GBK）解码 → 许可页满屏生僻字。三份都必须带 BOM。
+
+    再加两刀，防「三份是同一个文件的三个副本」这种假修复：
+      * 日文那份必须真有假名（否则就是中文原文换了文件名）；
+      * 英文那份不许出现中日文字符；
+      * 中文那份必须**逐字等于** `license_text()`（= 从 docs/07 生成的结果，单一来源没被手抄改掉）。
+    """
+    art = ROOT / "packaging" / "art"
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "artmod", str(ROOT / "packaging" / "make_installer_art.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    bad, seen = [], []
+    for name in ("license_zh.txt", "license_ja.txt", "license_en.txt"):
+        p = art / name
+        if not p.exists():
+            bad.append(f"{name} 不存在")
+            continue
+        head = p.read_bytes()[:4]
+        if head[:3] == b"\xef\xbb\xbf" or head[:2] == b"\xff\xfe":
+            seen.append(f"{name} {p.stat().st_size}B {head.hex(' ')}")
+        else:
+            bad.append(f"{name} 无 BOM（前 4 字节 {head.hex(' ')}）")
+    assert not bad, ("许可文本不合格（无 BOM → 安装向导里是乱码）：" + "、".join(bad)
+                     + "；跑 `python packaging/make_installer_art.py` 重新生成")
+    zh = (art / "license_zh.txt").read_text(encoding="utf-8-sig")
+    ja = (art / "license_ja.txt").read_text(encoding="utf-8-sig")
+    en = (art / "license_en.txt").read_text(encoding="utf-8-sig")
+    assert zh == mod.license_text(), "中文许可 ≠ 从 docs/07 生成的结果（被手抄改过了？）"
+    assert re.search(r"[\u3040-\u30ff]", ja), "日文那份里没有假名 —— 像是直接复制的中文原文"
+    assert not re.search(r"[\u4e00-\u9fff\u3040-\u30ff]", en), "英文那份里混进了中日文字符"
+    return ok("；".join(seen) + "；日文含假名、英文无中日文、中文逐字等于 docs/07 的生成结果")
+
+
+@case("B8 许可页按语言选文件（LicenseLangString × 3 + $(MUILicense)，不硬编码单一文件）")
+def t_license_langstring():
+    """MUI2 的官方做法是 `LicenseLangString` + `LicenseData` 吃语言串；顺序**有硬要求**：
+    页面宏 → `MUI_LANGUAGE` → `LicenseLangString`。顺序放错不会编译失败，只会让三行**静默塌到
+    语言 1033（英语）**并报 warning 6040 —— 所以这里既查写法，也查顺序，还查不许指回单文件。"""
+    code = _strip_nsi_comments(nsi_text())
+    assert '!insertmacro MUI_PAGE_LICENSE "$(MUILicense)"' in code, "许可页没有用 $(MUILicense)"
+    pairs = re.findall(r'^\s*LicenseLangString\s+(\S+)\s+\$\{LANG_(\w+)\}\s+"([^"]+)"',
+                       code, re.MULTILINE)
+    assert len(pairs) == 3, f"LicenseLangString 不是 3 条：{pairs}"
+    assert {p[1] for p in pairs} == {"SIMPCHINESE", "JAPANESE", "ENGLISH"}, pairs
+    assert len({p[0] for p in pairs}) == 1, f"三条语言串的名字不一致：{pairs}"
+    assert {p[2] for p in pairs} == {"art\\license_zh.txt", "art\\license_ja.txt",
+                                     "art\\license_en.txt"}, pairs
+    assert code.rindex("MUI_LANGUAGE") < code.index("LicenseLangString"), \
+        "LicenseLangString 出现在 MUI_LANGUAGE 之前 —— 会静默塌到 1033（英语）并报 warning 6040"
+    assert 'MUI_PAGE_LICENSE "art\\license.txt"' not in code, "又指回了单语言的无 BOM 文件"
+    return ok(f"{pairs[0][0]}：zh/ja/en 三份分别绑定；定义在 MUI_LANGUAGE 之后；未指回单文件")
 
 
 @case("C1 卸载段**全部**带 `un.` 前缀（漏了会在安装时执行卸载逻辑）")
@@ -214,6 +279,56 @@ def t_data_preserved():
     assert "不可恢复" in seg, "没有警示不可恢复"
     assert "您的数据不会被删除" in text, "没有在界面上明说数据保留"
     return ok("删数据段为 /o（默认不勾）+ 警示不可恢复；完成页重申数据保留")
+
+
+@case("C5 桌面快捷方式：可选段创建 + 卸载段**按 marker 条件化删除**")
+def t_desktop_shortcut():
+    """投诉之二：装完没有桌面快捷方式，而组件页却有个「开始菜单快捷方式」空壳（勾了等于没勾）。
+    这里钉住三件事：桌面那条是**可选段**（`/o`，默认不勾，不静默动用户桌面）、段体**真的建**、
+    而且**把「建了」登记进 marker**；卸载侧必须**按那条登记**判定，并用与创建时一致的
+    `SetShellVarContext`（否则删的是另一个位置，公共桌面的图标会留下来）。"""
+    code = _strip_nsi_comments(nsi_text())
+    m = re.search(r'Section\s+(/o\s+)?"[^"]*桌面快捷方式[^"]*"\s+(\w+)', code)
+    assert m, "找不到「桌面快捷方式」段"
+    assert m.group(1), "桌面快捷方式段不是可选（/o）—— 会静默往用户桌面放图标"
+    seg = code[m.start():m.end() + 1200]
+    # NSIS 的命令不分大小写（文件里 `CreateShortcut` 与 `CreateShortCut` 两种写法都有），
+    # 所以判据一律按 `(?i)` 匹配 —— 否则一个大小写就能让断言变成摆设。
+    assert re.search(r'(?i)CreateShortCut\s+"\$DESKTOP\\', seg), "段体里没有真的建桌面快捷方式"
+    assert "desktop_shortcut=1" in seg, "没有把「建了桌面快捷方式」登记进 marker"
+    un = code[code.index('Section "un.'):]
+    assert re.search(r'(?i)Delete\s+"\$DESKTOP\\', un), "卸载段没有删除桌面快捷方式"
+    assert "desktop_shortcut=1" in un, "卸载没有按 marker 里那一行判定（等于无条件删共享位置）"
+    assert "SetShellVarContext all" in un, "卸载删除时没有切回安装时的上下文（all）"
+    return ok("创建段为 /o（默认不勾）+ 登记 desktop_shortcut=1；卸载按该行判定且上下文一致（all）")
+
+
+@case("C6 `$DESKTOP` 出现 ≥2 次（创建 + 删除）——防「只有注释在骗人」")
+def t_desktop_occurrences():
+    """注释里写「这里会建桌面快捷方式」不算数：只数**去掉注释后的真实指令**。
+    这条是给「回归」上的保险 —— 曾经的情况就是全工程零 `$DESKTOP` 代码、只有注释在说会建。"""
+    code = _strip_nsi_comments(nsi_text())
+    n = code.count("$DESKTOP")
+    creates = len(re.findall(r'(?i)CreateShortCut\s+"\$DESKTOP\\', code))
+    deletes = len(re.findall(r'(?i)Delete\s+"\$DESKTOP\\', code))
+    assert n >= 2, f"$DESKTOP 只出现 {n} 次（要 ≥2：1 次创建 + 1 次删除）"
+    assert creates >= 1, f"$DESKTOP 的创建次数为 {creates}（要 ≥1）"
+    assert deletes >= 1, f"$DESKTOP 的删除次数为 {deletes}（要 ≥1）"
+    return ok(f"$DESKTOP 命中 {n} 处：CreateShortCut {creates} 次、Delete {deletes} 次")
+
+
+@case("C7 开始菜单段**真的建**那三个入口（不是 `SectionIn RO` + 空段体的假组件）")
+def t_startmenu_real():
+    """组件页上曾经有个「开始菜单快捷方式」：`SectionIn RO`（永远勾选、不可取消）**且段体是空的**。
+    勾了等于没勾 —— 这类条目比没有还坏（用户以为自己取消了什么）。现在它必须真有三个 CreateShortCut。"""
+    code = _strip_nsi_comments(nsi_text())
+    m = re.search(r'Section\s+(/o\s+)?"[^"]*开始菜单[^"]*"\s+(\w+)', code)
+    assert m, "找不到「开始菜单快捷方式」段"
+    body = code[m.end():code.index("SectionEnd", m.end())]
+    n = len(re.findall(r'(?i)CreateShortCut\s+"\$SMPROGRAMS\\', body))   # 命令不分大小写
+    assert n >= 3, f"开始菜单段体里只有 {n} 个 CreateShortCut（要 3：程序 / CLI / 卸载）"
+    assert "SectionIn RO" not in body, "开始菜单段仍被标成必需（RO）→ 不可取消 + 勾了等于没勾"
+    return ok(f"段体里 {n} 个 CreateShortCut；非 RO（默认勾选、可取消）")
 
 
 @case("D1/D2/D3 数据根规则：便携靠标记文件、安装态走用户目录、绝不用解包临时目录")
@@ -417,6 +532,27 @@ def t_packaging_boundary():
                 bad.append(f"{p.name}:{k}")
     assert not bad, f"打包面出现不该有的关键词：{bad}"
     return ok("安装器/打包脚本：零对抗词汇、零裸网络调用（检测词表已显式豁免）")
+
+
+@case("F5 图标体检 tools/icon_check.py（存在则必须退出码 0；未写则 SKIP 并说明）")
+def t_icon_check():
+    """图标是安装器的第一眼（exe 属性、快捷方式、控制面板都读它）。另一个代理在写这个体检脚本，
+    写好即自动纳入门禁；**没写好不算通过**，但也绝不用一条假断言冒充检查过。"""
+    script = ROOT / "tools" / "icon_check.py"
+    if not script.exists():
+        return skip("tools/icon_check.py 尚未存在（另一个代理在做）——就位后本项自动开始把关")
+    r = subprocess.run([sys.executable, str(script)], cwd=str(ROOT),
+                       capture_output=True, text=True, shell=False)   # 字面量 argv + shell=False
+    # ⚠️ 子工具的输出**不能原样带进本门禁的 stdout**：`tools/baseline.py` 用「共 N 项」数门禁项数，
+    #    而 icon_check 自己的结尾行是「…（共 13 项）」——照抄过来会让基线把 13 当成 s10b 的项数
+    #    （实测：总数从应有的 256 掉到 242，基线报「项数不该减少」的假警报）。所以只留计数摘要文字。
+    lines = [ln for ln in (r.stdout or r.stderr or "").strip().splitlines() if "共" not in ln]
+    head = " / ".join(lines[-3:])
+    m = re.search(r"通过\s*(\d+)\s*/\s*违规\s*(\d+)\s*/\s*过期\s*(\d+)\s*/\s*跳过\s*(\d+)", r.stdout or "")
+    counts = (f"通过 {m.group(1)} / 违规 {m.group(2)} / 过期 {m.group(3)} / 跳过 {m.group(4)}"
+              if m else "见 tools/icon_check.py 输出")
+    assert r.returncode == 0, f"icon_check 退出码 {r.returncode}（{counts}）：{head[-200:]}"
+    return ok(f"退出码 0（{counts}）")
 
 
 # ══════════════════════════════════════════════════════════════════

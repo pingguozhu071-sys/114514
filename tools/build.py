@@ -8,6 +8,7 @@
 
 四条纪律（对应《06》的交付门槛）：
   1) **缺件硬报错**：PyInstaller / NSIS / 图标 / 关键资源任一缺失 → 中止（不留"半成品看起来像成功"）；
+     许可页三份文本还多一条**字节级硬断言**（必须带 BOM，否则许可页在向导里是乱码生僻字）；
   2) **dry-run 先自证**：`--dry-run` 打印每一步，**不创建任何文件**；
   3) **产物核对**：两个 EXE、`_internal`、资源、版本资源都在，少一个就报错；
   4) **少起子进程**：版本校验/美术/PyInstaller 全部**当模块调**（同一进程内，有真回溯、
@@ -41,6 +42,8 @@ NSIS_CANDIDATES = (
 )
 
 REQUIRED_IN_BUNDLE = ("daedalus.exe", "daedalus-cli.exe", "_internal")
+# 许可页文本三份（zh/ja/en，由 packaging/make_installer_art.py 生成）；**每份都必须带 BOM**
+REQUIRED_LICENSES = ("license_zh.txt", "license_ja.txt", "license_en.txt")
 # 打包面**必须有**的东西：正版 playwright 的驱动数据（浏览器环境靠它起驱动进程）。
 # 踩过的坑：patchright 的 PyInstaller 钩子会冒充 `playwright.sync_api` 的 hook，
 # 把**改装分支**的驱动收进包 → 必须显式收集 + 在这里硬断言。
@@ -68,6 +71,35 @@ def _ensure_bom(path: pathlib.Path) -> bool:
         return False
     path.write_bytes(b"\xef\xbb\xbf" + raw)
     return True
+
+
+def assert_license_bom(art: pathlib.Path = ART) -> list[str]:
+    """**硬断言**三份许可文本都在、而且都带 BOM；不满足直接 `SystemExit`（绝不静默放行）。
+
+    为什么要在构建期钉死：许可页乱码是**用户看得见**的交付缺陷，可它的成因只是**少了 3 个字节**
+    （NSIS 的 `LicenseData` 对无 BOM 文件按**本机 ANSI 代码页**解码，简体中文机器上就是 GBK），
+    在构建日志、产物核对、单元测试里全都看不出来 —— 只有真的打开安装向导才暴露。
+    所以判据放在这里：前 3 字节 `EF BB BF`（UTF-8 BOM）或前 2 字节 `FF FE`（UTF-16LE BOM）。
+    """
+    bad: list[str] = []
+    ok_lines: list[str] = []
+    for name in REQUIRED_LICENSES:
+        p = art / name
+        if not p.exists():
+            bad.append(f"{name} 不存在")
+            continue
+        head = p.read_bytes()[:4]
+        if head[:3] == b"\xef\xbb\xbf" or head[:2] == b"\xff\xfe":
+            ok_lines.append(f"{name}（{p.stat().st_size} 字节，前 4 字节 {head.hex(' ')}）")
+        else:
+            bad.append(f"{name} 无 BOM（前 4 字节 {head.hex(' ')}）")
+    if bad:
+        raise SystemExit(
+            "许可文本不合格：NSIS 会按**本机 ANSI 代码页**解码无 BOM 的文件 → 许可页乱码生僻字。\n"
+            + "\n".join(f"  ✗ {b}" for b in bad)
+            + f"\n  目录：{art}\n"
+            + "  修法：`python packaging/make_installer_art.py`（三份都会写成 UTF-8 with BOM）。")
+    return ok_lines
 
 
 def find_nsis() -> str:
@@ -139,7 +171,7 @@ def build(*, dry: bool = False, exe_only: bool = False, skip_art: bool = False) 
         print("   中止：**缺件硬报错**（要么补齐，要么显式 --exe-only）")
         return 2
 
-    print(f"③ 安装器美术：{'跳过' if skip_art else '生成 packaging/art/（welcome.bmp / header.bmp / license.txt）'}")
+    print(f"③ 安装器美术：{'跳过' if skip_art else '生成 packaging/art/（welcome.bmp / header.bmp / 三份许可文本）'}")
     if not skip_art:
         art = _load(PKG / "make_installer_art.py", "daedalus_installer_art")
         _say("模块调用", "packaging/make_installer_art.py", "main([])")
@@ -167,6 +199,9 @@ def build(*, dry: bool = False, exe_only: bool = False, skip_art: bool = False) 
         print("⑤ 安装器：跳过（--exe-only）")
     else:
         print("⑤ NSIS 安装器（唯一的子进程：makensis.exe，字面量参数列表 + shell=False）")
+        # 调 makensis **之前**的编码硬断言：三份许可文本必须都在且带 BOM（dry-run 也查——这是自证）。
+        for line in assert_license_bom():
+            print(f"   · 许可文本 {line}")
         if not dry and _ensure_bom(PKG / "installer.nsi"):
             print("   · 已给 installer.nsi 补上 UTF-8 BOM（NSIS 3 只认带 BOM 的 UTF-8）")
         _say(pf["nsis"], "/V2", PKG / "installer.nsi")

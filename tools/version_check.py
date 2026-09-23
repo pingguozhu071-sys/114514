@@ -4,7 +4,8 @@
 唯一来源：`src/daedalus/__init__.py` 的 `VERSION`。**任何别处都不许硬编码版本号**。
 四件套（都由这里从单一来源生成/校验）：
   1) Python 包内：`daedalus.VERSION` / `about()`（界面、CLI、报告都读它）
-  2) 安装脚本：`packaging/version.nsh`（NSIS 的 `APP_VERSION` + 数字版 `VIProductVersion`）
+  2) 安装脚本：`packaging/version.nsh`（NSIS 的 `APP_VERSION` + 数字版 `VIProductVersion`；
+     **带 UTF-8 BOM** —— NSIS 3 对无 BOM 文件按本机 ANSI 代码页解码）
   3) 可执行文件属性：`packaging/version_info.txt`（PyInstaller `--version-file`）
   4) 发行元数据：`pyproject.toml` 的 `version`（打包成 wheel/sdist 时用）
 
@@ -29,6 +30,22 @@ VERSION_PY = ROOT / "src" / "daedalus" / "__init__.py"
 NSH = ROOT / "packaging" / "version.nsh"
 VERSION_INFO = ROOT / "packaging" / "version_info.txt"
 PYPROJECT = ROOT / "pyproject.toml"
+
+# 每个消费方写盘用的编码（**不是随手选的**）：
+#   * `version.nsh` 用 **utf-8-sig（带 BOM）**：它被 `installer.nsi` `!include`，而 NSIS 3 对
+#     **无 BOM** 的文件按本机 ANSI 代码页解码 —— 里面的中文注释在这台机器上是 `# ...`（碰巧没事），
+#     但同一份文件里只要出现一个中文字符串就是乱码事故。BOM 是唯一的编码声明方式（NSIS 无 pragma）。
+#   * `pyproject.toml` **绝不能带 BOM**：`tomllib` 见到 BOM 直接抛 TOMLDecodeError，装包就废。
+#   * `version_info.txt` 由 PyInstaller 读（它自己按 utf-8 处理），维持不带 BOM。
+TARGET_ENCODING = {NSH: "utf-8-sig", VERSION_INFO: "utf-8", PYPROJECT: "utf-8"}
+
+
+def has_bom(path: pathlib.Path) -> bool:
+    """前 3 字节是不是 UTF-8 BOM（`utf-8-sig` 读盘时会把 BOM 吃掉，所以必须另查字节）。"""
+    try:
+        return path.read_bytes()[:3] == b"\xef\xbb\xbf"
+    except OSError:
+        return False
 
 
 def source_version() -> str:
@@ -146,17 +163,25 @@ def check(*, write: bool = False) -> dict:
                     "consumers": {}, "stray": [], "ok": False}
     targets = [(NSH, want_nsh), (VERSION_INFO, want_vi), (PYPROJECT, want_pp)]
     for path, want in targets:
-        cur = path.read_text(encoding="utf-8") if path.exists() else ""
-        same = cur == want
-        report["consumers"][path.relative_to(ROOT).as_posix()] = {
-            "exists": path.exists(), "in_sync": same}
+        enc = TARGET_ENCODING[path]
+        want_bom = enc == "utf-8-sig"
+        # `utf-8-sig` 读盘会把 BOM 吃掉 → 「内容相同」**不足以**说明文件是对的：
+        # 少了 BOM 的 version.nsh 内容一模一样，却会让 NSIS 按本机代码页解它 → 必须单独查字节。
+        cur = path.read_text(encoding=enc) if path.exists() else ""
+        bom_ok = has_bom(path) if want_bom else True
+        same = (cur == want) and bom_ok
+        key = path.relative_to(ROOT).as_posix()
+        report["consumers"][key] = {"exists": path.exists(), "in_sync": same,
+                                    "bom": has_bom(path) if want_bom else None}
         if write and not same:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(want, encoding="utf-8")
-            report["consumers"][path.relative_to(ROOT).as_posix()]["written"] = True
-            report["consumers"][path.relative_to(ROOT).as_posix()]["in_sync"] = True
+            path.write_text(want, encoding=enc)          # utf-8-sig = 写盘时带上 BOM
+            report["consumers"][key]["written"] = True
+            report["consumers"][key]["in_sync"] = True
+            report["consumers"][key]["bom"] = has_bom(path) if want_bom else None
         elif not same:
-            report["consumers"][path.relative_to(ROOT).as_posix()]["note"] = "与单一来源不一致"
+            report["consumers"][key]["note"] = ("与单一来源不一致" if cur != want else
+                                              "缺 UTF-8 BOM（NSIS 按本机 ANSI 代码页解它）")
     report["stray"] = stray_literals(version)
     report["ok"] = (all(c.get("in_sync") for c in report["consumers"].values())
                     and not report["stray"])
