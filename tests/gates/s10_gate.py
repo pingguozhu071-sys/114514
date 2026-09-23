@@ -286,12 +286,20 @@ def t_perf():
     from perf_probe import probe
     rep = probe(real=False, out=_TMP / "perf.json")
     bad = [c for c in rep["checks"] if not c["ok"]]
+    # **机器忙时（比如长跑在跑）这些数字测不准**：把"负载"当成一等事实报出来，
+    # 而不是让"机器忙"伪装成"性能回归"（实测踩过：同一套代码在负载下停顿超线，
+    # 白查了一轮发现是后台长跑抢 CPU）。
+    if bad and not rep.get("measurement_trustworthy", True):
+        return skip(f"机器负载 {rep.get('machine_load_pct')}%（>50%）——停顿时延不可信；"
+                    f"探针已标注 measurement_trustworthy=false，请在空闲机器上复测")
     assert not bad, bad
     assert rep["cache"]["hits"] >= 4, rep["cache"]
     assert rep["scheduler"]["coalesced"] >= 5, rep["scheduler"]
+    load = rep.get("machine_load_pct")
     return ok(f"停顿 {rep['beats_ms_max']}ms｜切页 {max(rep['switches_ms'].values()):.2f}ms｜"
               f"重排 {max(rep['reflows_ms'])}ms｜管线峰值 {rep['pipeline']['peak_mb']}MB｜"
-              f"缓存命中 {rep['cache']['hits']}｜防抖合并 {rep['scheduler']['coalesced']}")
+              f"缓存命中 {rep['cache']['hits']}｜防抖合并 {rep['scheduler']['coalesced']}"
+              + (f"｜负载 {load:.0f}%" if load is not None else ""))
 
 
 @case("C5 代数号守卫：过期结果被丢弃（不覆盖当前状态）")

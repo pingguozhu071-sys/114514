@@ -28,6 +28,17 @@ sys.path.insert(0, str(ROOT / "src"))
 
 # 红线（与设计系统一致）
 STALL_MS, SWITCH_MS, REFLOW_MS, PIPE_MB = 200.0, 400.0, 1200.0, 200.0
+# 机器负载上限（%）：超过它，停顿/切页数字不可信（不是回归，是被别的进程抢了 CPU）
+BUSY_PCT = 50.0
+
+
+def _machine_load() -> float | None:
+    """整机 CPU 使用率（拿不到就返回 None —— **不猜**）。"""
+    try:
+        import psutil
+        return float(psutil.cpu_percent(interval=0.2))
+    except Exception:
+        return None
 
 
 def _make_test_image(path: pathlib.Path, w: int, h: int, *, colorful: bool = True) -> None:
@@ -141,12 +152,19 @@ def probe(*, real: bool = False, out: pathlib.Path | None = None) -> dict:
         {"name": "debounce_coalesced", "value": sched.stats()["coalesced"], "limit": "≥5",
          "ok": sched.stats()["coalesced"] >= 5},
     ]
+    # **机器忙的时候这些数字测不准**（实测：长跑在跑时同一套代码的停顿从 0.0ms 变成超线）。
+    # 用具名指标说明"这次测量是否可信"，而不是让读者把"机器忙"误读成"性能回归"。
+    load = _machine_load()
+    busy = load is not None and load > 50.0
     report = {"platform": "real" if real else "offscreen", "hearts": len(beats),
               "beats_ms_max": stall_max, "switches_ms": switches, "reflows_ms": reflows,
               "pipeline": pipe, "cache_ms_all": cache_ms, "cache": cache.stats(),
               "scheduler": sched.stats(), "accent": accent, "checks": checks,
+              "machine_load_pct": load, "measurement_trustworthy": not busy,
               "all_ok": all(c["ok"] for c in checks),
-              "note": "offscreen 平台的绝对耗时偏乐观（无真实合成器）；关注**相对变化**与缓存命中"}
+              "note": ("offscreen 平台的绝对耗时偏乐观（无真实合成器）；关注**相对变化**与缓存命中。"
+                       + (" ⚠️ 本次采样时机器负载较高（>50%）：停顿/切页数字**不可信**，"
+                          "请在空闲机器上复测。" if busy else ""))}
     if out:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
