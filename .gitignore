@@ -1,0 +1,67 @@
+# ── 凭据与密钥（红线：绝不入包 / 不入库明文 / 不进日志）────────────
+*cookies*.txt
+*cookies*.json
+cookie*.txt
+master.key*
+secrets/
+*.bin
+!requirements*.txt
+.env
+.env.*
+
+# ── 运行数据（数据根默认在用户目录；这里只兜底"误建在工程里"的情况）──
+data/
+DaedalusData/
+*.part
+*.aria2
+deadletter*.jsonl
+
+# ── 原始层与产物（体积大、可重放，绝不入库）──────────────────────
+raw/
+artifacts/
+out/
+dist/
+build/
+
+# ── Python ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+coverage.xml
+htmlcov/
+
+# ── 打包与安装器（产物与中间件）──────────────────────────────────
+*.spec.bak
+packaging/build/
+packaging/dist/
+packaging/output/
+*.exe
+*.7z
+*.zip
+
+# ── 编辑器/系统 ────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+
+# ── 工具链状态（插件/钩子生成的会话文件，不属于工程）──────────────
+.mimosa/
+.v2c/
+.video_agent/
+.claude/
+
+# ── 工具产物 ────────────────────────────────────────────────────
+.coverage
+coverage.json
+*.log
+perf_*.json
+bench_runs.jsonl
+soak_*.jsonl
+soak_report.json
