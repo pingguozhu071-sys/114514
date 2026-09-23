@@ -112,7 +112,8 @@ def _windows_of(pid: int) -> list[tuple[int, str, tuple[int, int, int, int]]]:
     return out
 
 
-def grab(lang: int | None, out: pathlib.Path, *, settle: float = 4.0) -> pathlib.Path:
+def grab(lang: int | None, out: pathlib.Path, *, settle: float = 4.0,
+         maximize: bool = False) -> pathlib.Path:
     from PIL import ImageGrab
     if not APP.exists():
         raise SystemExit(f"没找到打包好的界面程序：{APP}（先跑 tools/build.py）")
@@ -144,6 +145,11 @@ def grab(lang: int | None, out: pathlib.Path, *, settle: float = 4.0) -> pathlib
         time.sleep(settle)                                  # 让底图管线/入场动画跑完
         wins = _windows_of(pid) or [win]
         hwnd, title, _box = max(wins, key=lambda w: (w[2][2] - w[2][0]) * (w[2][3] - w[2][1]))
+        if maximize:
+            # 最大化后再抓：一是看大尺寸下的排版，二是避开「窗口尺寸 vs 屏幕缩放」
+            # 造成的截图歧义（本机 150% 缩放，窗口截图里会混进桌面区域，肉眼分不清）。
+            ctypes.windll.user32.ShowWindow(hwnd, 3)        # 3 = SW_MAXIMIZE
+            time.sleep(1.2)
         ctypes.windll.user32.SetForegroundWindow(hwnd)
         time.sleep(0.8)
         r = wt.RECT()
@@ -175,8 +181,9 @@ def main() -> int:
     ap.add_argument("--lang", type=int, help="写入 install.marker 的 LCID（2052 简体 / 1041 日语 / 1033 英语）")
     ap.add_argument("--out", required=True, help="输出 PNG")
     ap.add_argument("--settle", type=float, default=4.0, help="窗口出现后再等几秒（默认 4）")
+    ap.add_argument("--maximize", action="store_true", help="先最大化再抓（看大尺寸排版，避开缩放歧义）")
     a = ap.parse_args()
-    grab(a.lang, pathlib.Path(a.out), settle=a.settle)
+    grab(a.lang, pathlib.Path(a.out), settle=a.settle, maximize=a.maximize)
     return 0
 
 

@@ -688,6 +688,308 @@ def t_metrics_poll():
               f"（耗时 {rec['last_ms']:.1f}ms，红线 {MainWindow.SLOW_MS}ms 超了会自动降频）")
 
 
+@case("E9 动效真的在动（不是「有开关、没动效」）+ 投递走 postEvent")
+def t_motion_really_moves():
+    """机主原话：「太硬了、一点动向都没有」。而当时的真相是——**有动效开关，没有动效**：
+    `animations/fade_ms/fps_cap` 三个令牌被声明、被存盘、被界面暴露，但全仓没有任何代码消费它们。
+    这条门禁既验「令牌真的驱动行为」，也验「关掉开关是立刻落终态（不是不响应）」。
+    """
+    import time as _t
+    from daedalus.ui.theme import tokens as mk
+    from daedalus.ui.widgets import GlassCard, StatCard
+    on, off = mk(animations=True), mk(animations=False)
+    # ① 令牌 → 时长（纯函数，先钉死语义）
+    assert on.anim_ms(450) == 450 and off.anim_ms(450) == 0, "总开关没接线"
+    assert (on.hover_ms(), on.roll_ms(), on.frame_min_ms()) == (120, 360, 33), \
+        (on.hover_ms(), on.roll_ms(), on.frame_min_ms())
+    assert off.hover_ms() == 0 and off.roll_ms() == 0, "关掉开关还有时长"
+    # ② 悬停：开着 → 得等动画；关掉 → 立刻落终态
+    import pathlib
+    import tempfile
+    b = _fresh_window()
+    win, app = b["window"], b["app"]
+    d = pathlib.Path(tempfile.mkdtemp(prefix="dae_motion_"))
+    from PySide6.QtWidgets import QFrame
+    cards = [w for w in win.findChildren(QFrame)
+             if w.objectName() in ("card", "statCard")]
+    assert cards, "窗口里没有卡片"
+    card_on = cards[0]
+    card_on._tokens = on                                   # noqa: SLF001
+    GlassCard._hover_to(card_on, 1.0)
+    mid = float(card_on._hover_t)                          # noqa: SLF001
+    assert mid < 0.99, f"悬停是硬切不是动画：{mid}"
+    t0 = _t.perf_counter()
+    while _t.perf_counter() - t0 < 0.5:
+        app.processEvents()
+        _t.sleep(0.02)
+    assert float(card_on._hover_t) > 0.99, card_on._hover_t      # noqa: SLF001
+    qss_hover = card_on.styleSheet()
+    card_on._tokens = off                                  # noqa: SLF001
+    GlassCard._hover_to(card_on, 0.0)
+    assert float(card_on._hover_t) == 0.0, "关掉动效后悬停没有立刻落终态"    # noqa: SLF001
+    assert card_on.styleSheet() != qss_hover, "悬停没有改变样式（等于没反馈）"
+    # ③ 数字滚动：开着 → 先出中间值；关掉 → 一步到位
+    stat = StatCard.make(on, "探针", "0")
+    StatCard.set_value(stat, "12.3")
+    stat._tokens = on                                      # noqa: SLF001
+    StatCard.set_value(stat, "45.6")
+    assert stat._roll_anim is not None, "数字没有滚动动画"       # noqa: SLF001
+    t0 = _t.perf_counter()
+    while _t.perf_counter() - t0 < 0.8:
+        app.processEvents()
+        _t.sleep(0.02)
+    assert stat._value_label.text() == "45.6", stat._value_label.text()   # noqa: SLF001
+    stat2 = StatCard.make(off, "探针", "0")
+    StatCard.set_value(stat2, "7.7")
+    assert stat2._value_label.text() == "7.7", "关掉动效后还在滚"          # noqa: SLF001
+    # ④ 底图交叉溶解：换第二张图时才发生，且关掉开关就不发生
+    from daedalus.ui.wallpaper import process_wallpaper
+    sys.path.insert(0, str(ROOT / "tools"))
+    from perf_probe import _make_test_image
+    p1, p2 = d / "a.png", d / "b.png"
+    _make_test_image(p1, 320, 200)
+    _make_test_image(p2, 320, 200)
+    from daedalus.ui.app import MainWindow
+    q1, m1 = process_wallpaper(str(p1), width=400, height=300, blur=0)
+    q2, m2 = process_wallpaper(str(p2), width=400, height=300, blur=0)
+    MainWindow.apply_tokens(win, on)
+    MainWindow.set_wallpaper(win, q1, m1)
+    MainWindow.set_wallpaper(win, q2, m2)
+    fade = win._ui["state"].get("wallpaper_fade") or {}     # noqa: SLF001
+    assert fade.get("animated") is True, f"换底图没有交叉溶解：{fade}"
+    assert fade.get("fade_ms") == 450, fade
+    MainWindow.apply_tokens(win, off)
+    MainWindow.set_wallpaper(win, q1, m1)
+    fade2 = win._ui["state"].get("wallpaper_fade") or {}    # noqa: SLF001
+    assert fade2.get("animated") is False, f"关掉动效还溶解：{fade2}"
+    # ⑤ 投递方式：跨线程结果走 postEvent（不是 Signal）
+    rsrc = (ROOT / "src" / "daedalus" / "ui" / "render.py").read_text(encoding="utf-8")
+    assert "postEvent" in rsrc, "渲染投递没走 postEvent"
+    assert "Signal(int, object)" not in rsrc, "还留着跨线程 Signal 投递（Kiana 的红线）"
+    return ok(f"悬停 {mid:.2f}→1.0（120ms）｜数字滚动到 45.6（360ms）｜底图溶解 "
+              f"{fade.get('fade_ms')}ms｜关掉开关三项都立刻落终态｜投递=postEvent")
+
+
+@case("E10 日志页有真数据源（不是永远空白的摆设）")
+def t_logs_page_live():
+    """真 bug：`#logView` 全仓**零** `appendPlainText` 调用者 —— 那个面板永远是空框，
+    用户看不到任何日志，也看不到界面自己报的「底图不可用/设置被拒」。
+    这条门禁要求：写一条日志 → 面板里真的出现；带凭据的 URL → 必须已脱敏。
+    """
+    import logging
+    b = _fresh_window()
+    win, app = b["window"], b["app"]
+    page = win._ui["pages"]["logs"]                         # noqa: SLF001
+    view = getattr(page, "_view", None)
+    assert view is not None, "日志页没有视图"
+    assert getattr(page, "_handler", None) is not None, "日志页没有装 handler（还是摆设）"
+    assert int(view.maximumBlockCount()) == 5000, view.maximumBlockCount()
+    logging.getLogger("daedalus.gate.probe").warning("门禁探针：%s", "hello")
+    logging.getLogger("daedalus.gate.probe").error(
+        "带凭据的地址 https://e.test/x?token=SECRET123456")
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < 1.0:
+        app.processEvents()
+        time.sleep(0.02)
+    text = view.toPlainText()
+    assert "门禁探针" in text and "hello" in text, f"日志没进面板：{text[-200:]!r}"
+    assert "SECRET123456" not in text, "面板里的凭据没有被脱敏（红线）"
+    assert "[REDACTED]" in text or "REDACTED" in text, text[-200:]
+    # 界面自己的提示也要能看到（原来是"用户永远不知道为什么不生效"）
+    win._ui["ctx"].notify("门禁探针：设置被拒", error=True)     # noqa: SLF001
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < 1.2:
+        app.processEvents()
+        time.sleep(0.02)
+    assert "设置被拒" in view.toPlainText(), "界面提示没有显示出口"
+    return ok(f"面板接了真 handler（上限 {view.maximumBlockCount()} 行）；日志与界"
+              f"面提示都可见；凭据已脱敏")
+
+
+@case("E11 快速采集：开始真的起任务、停止真的能停（走真实按钮信号）")
+def t_collect_card():
+    """机主的抱怨是「模块估计都用不了」——每个页面都只能看。概览页现在有一条真路径：
+    贴目标 → 开始 → 指标动 → 可停。这条门禁用**桩引擎**验按钮真的接上了：
+    桩的 `run_targets` 一直阻塞到 `stop_event` 被 set，所以「停止」能不能停是**可判定**的。
+    """
+    import threading
+    import time as _t
+
+    class _StubEngine:
+        def __init__(self):
+            self.calls: list = []
+            self.stop_event = None
+            self.enter = threading.Event()
+
+        def run_targets(self, urls, *, workers=0, stop_event=None, **kw):
+            self.calls.append(list(urls))
+            self.stop_event = stop_event
+            self.enter.set()
+
+            class _S:
+                done, failed, stopped_early = 1, 0, True
+            deadline = _t.time() + 10
+            while _t.time() < deadline:
+                if stop_event is not None and stop_event.is_set():
+                    break
+                _t.sleep(0.02)
+            return _S()
+
+    b = _fresh_window()
+    win, app = b["window"], b["app"]
+    stub = _StubEngine()
+    win._ui["ctx"].engine = stub                                # noqa: SLF001
+    page = win._ui["pages"]["overview"]                         # noqa: SLF001
+    # 页面是**建好之后**注入的桩引擎，所以重建一次页面让它读到桩
+    from daedalus.ui.pages import build_pages
+    new_pages = build_pages(win, win._ui["tokens"], win._ui["ctx"])   # noqa: SLF001
+    page = new_pages["overview"]
+    win._ui["pages"] = new_pages                                # noqa: SLF001
+    c = getattr(page, "_collect", None)
+    assert c, "概览页没有快速采集卡"
+    assert c["start"].isEnabled(), "有引擎时开始按钮应当可用"
+    c["box"].setPlainText("https://gate.test/a\nhttps://gate.test/b\n")
+    c["start"].click()
+    assert stub.enter.wait(5), "点了开始但引擎没被调用"
+    assert stub.calls and stub.calls[0] == ["https://gate.test/a", "https://gate.test/b"], stub.calls
+    assert not c["start"].isEnabled() and c["stop"].isEnabled(), "运行中按钮状态不对"
+    c["stop"].click()
+    assert stub.stop_event is not None and stub.stop_event.wait(3), "点了停止但 stop_event 没被 set"
+    t0 = _t.perf_counter()
+    while _t.perf_counter() - t0 < 5:
+        app.processEvents()
+        _t.sleep(0.02)
+        if c["start"].isEnabled():
+            break
+    assert c["start"].isEnabled(), "跑完之后开始按钮没有恢复"
+    # 引擎侧契约：`run_targets` 真收这个参数、真检查它（UI 桩之外，源码级钉一下）
+    src = (ROOT / "src" / "daedalus" / "core" / "app.py").read_text(encoding="utf-8")
+    assert "stop_event" in src and "stop_event.is_set()" in src, "引擎没有检查 stop_event"
+    return ok("开始→引擎收到两个目标；运行中禁用开始/启用停止；点停止 → stop_event 置位；"
+              "跑完自动恢复；引擎侧确实检查该事件")
+
+
+@case("E12 任务页三操作：重试/导出/删除都真调引擎；删除**没确认就不删**")
+def t_task_tools():
+    """三个按钮各自都能干真事，而且各有一条不能退让的规矩：
+    导出必须走**同一实现（已脱敏）**；删除**必须先弹确认**、且先跑一次 dry-run 自证；
+    引擎没起来时三个按钮都禁用（不是点了没反应）。
+    """
+    import json as _json
+    import pathlib
+    import tempfile
+    from PySide6.QtWidgets import QFileDialog, QMessageBox
+
+    class _StubEngine:
+        def __init__(self):
+            self.retried: list = []
+            self.exported: list = []
+            self.dry: list = []
+            self.forgot: list = []
+
+        def retry_tasks(self, ids, **kw):
+            self.retried.append(list(ids))
+            return {"requested": len(ids), "ok": len(ids),
+                    "results": [{"task_id": i, "ok": True, "why": "ok"} for i in ids]}
+
+        def export_tasks_jsonl(self, ids, **kw):
+            self.exported.append(list(ids))
+            return _json.dumps({"kind": "task", "task_id": list(ids)[0],
+                                "target": "https://e.test/x?token=[REDACTED]"},
+                               ensure_ascii=False)
+
+        def forget_tasks(self, ids, dry_run=True, **kw):
+            (self.dry if dry_run else self.forgot).append(list(ids))
+            return {"dry_run": dry_run, "requested": len(ids),
+                    "deleted": {"tasks": len(ids), "task_evidence": 2, "errors": 0}}
+
+    b = _fresh_window()
+    win, app = b["window"], b["app"]
+    stub = _StubEngine()
+    win._ui["ctx"].engine = stub                               # noqa: SLF001
+    from daedalus.ui.app import MainWindow
+    from daedalus.ui.pages import build_pages
+    new_pages = build_pages(win, win._ui["tokens"], win._ui["ctx"])   # noqa: SLF001
+    win._ui["pages"] = new_pages                              # noqa: SLF001
+    page = new_pages["tasks"]
+    tools, table = getattr(page, "_tools", None), page._table          # noqa: SLF001
+    assert tools, "任务页没有工具行"
+    # 真填两行（走 app.py 的 `_fill_task_table`，task_id 会被写进第 0 列 UserRole）
+    MainWindow.refresh_pages(win, {"summary": {}, "tasks": [
+        {"task_id": "t1", "state": "dead", "target": "https://e.test/a", "attempts": 3,
+         "content_hash": "ab" * 32},
+        {"task_id": "t2", "state": "failed", "target": "https://e.test/b", "attempts": 1,
+         "content_hash": "cd" * 32}]})
+    app.processEvents()
+    assert table.rowCount() == 2, table.rowCount()
+    from PySide6.QtCore import Qt as _Qt
+    assert table.item(0, 0).data(_Qt.ItemDataRole.UserRole) == "t1", "task_id 没写进 UserRole"
+    # 没选行 → 三个按钮点了都不动作（只给提示）
+    tools["retry"].click()
+    app.processEvents()
+    assert not stub.retried, "没选行却调了引擎"
+    # 选中第 0 行
+    table.selectRow(0)
+    app.processEvents()
+    tools["retry"].click()
+    app.processEvents()
+    assert stub.retried == [["t1"]], stub.retried
+    # 导出：桩掉保存对话框 → 真写文件、内容已脱敏
+    out = pathlib.Path(tempfile.mkdtemp(prefix="dae_export_")) / "sel.jsonl"
+    QFileDialog.getSaveFileName = staticmethod(lambda *a, **k: (str(out), ""))
+    tools["export"].click()
+    app.processEvents()
+    assert stub.exported == [["t1"]], stub.exported
+    assert out.exists(), "导出没有真的写文件"
+    body = out.read_text(encoding="utf-8")
+    assert "[REDACTED]" in body and "token=SECRET" not in body, body[:120]
+    assert "token=[REDACTED]" in body, "导出没有过脱敏"
+    # 删除：**先点「否」→ 一行都不删**
+    QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.StandardButton.No)
+    tools["forget"].click()
+    app.processEvents()
+    assert not stub.forgot and not stub.dry, "没确认就把记录删了（红线）"
+    # 再点「是」→ 先 dry-run 自证、再真删
+    QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
+    tools["forget"].click()
+    app.processEvents()
+    assert stub.dry == [["t1"]] and stub.forgot == [["t1"]], (stub.dry, stub.forgot)
+    # 引擎没起来 → 三个按钮禁用
+    win._ui["ctx"].engine = None                              # noqa: SLF001
+    p2 = build_pages(win, win._ui["tokens"], win._ui["ctx"])["tasks"]   # noqa: SLF001
+    t2 = getattr(p2, "_tools")
+    assert all(not t2[k].isEnabled() for k in ("retry", "export", "forget")), "引擎没起来按钮还能点"
+    return ok("重试/导出/删除各自真调引擎；未选行不动作；导出过脱敏并真落盘；"
+              "删除没确认不执行、确认后先 dry-run 再删；无引擎时三按钮禁用")
+
+
+@case("E13 导航项五页齐全（objectName 撞名会让库静默少建项）")
+def t_nav_items_all():
+    """真 bug：五页的 `objectName` 全是同一个 `pageRoot`，而库拿它当**路由键**——
+    于是**只有第一个**导航项建出来，其余四个 `addSubInterface` 静默返回 None。
+    切页走的是页栈（照样能用），所以功能门禁全绿、只有**看真窗口截图**才发现「导航里只剩概览」。
+    这条门禁钉死两件事：导航项五个都在、每页 objectName 唯一。
+    """
+    b = _fresh_window()
+    win = b["window"]
+    items = win._ui["nav_items"]                                   # noqa: SLF001
+    missing = [k for k, w in items.items() if w is None]
+    assert not missing, f"这些页没有导航项（objectName 撞名？）：{missing}"
+    pages = win._ui["pages"]                                      # noqa: SLF001
+    names = [pages[k].objectName() for k in pages]
+    assert len(set(names)) == len(names), f"页面 objectName 撞名：{names}"
+    assert all(n.startswith("pageRoot") for n in names), names
+    # 导航项的文本要跟语言一致（换语言后仍是五项、文字跟着变）
+    from daedalus.ui.app import MainWindow
+    r = MainWindow.apply_locale(win, "ja-JP")
+    items2 = win._ui["nav_items"]                                 # noqa: SLF001
+    assert not [k for k, w in items2.items() if w is None], "换语言后导航项丢了"
+    assert all(w.text() for w in items2.values()), [w.text() for w in items2.values()]
+    MainWindow.apply_locale(win, "zh-CN")
+    return ok(f"五个导航项齐全（{list(items)}）；页面 objectName 唯一（{names[0]} …）；"
+              f"换语言后仍是五项（日文标题示例：{r['nav'][:2]}）")
+
+
 # ══════════════════════════════════════════════════════════════════
 def main() -> int:
     fails = skips = 0

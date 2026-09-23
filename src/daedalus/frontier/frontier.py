@@ -88,6 +88,44 @@ class Frontier:
 
         return self.writer.run_now(job, label="frontier.enqueue")
 
+    def requeue(self, task_ids, *, max_attempts: int = 5) -> list[tuple[str, bool, str]]:
+        """把**已有任务**重新排回队列（界面上的「重试」走这里）。返回 `[(id, 成功?, 原因)]`。
+
+        为什么不能复用 `enqueue`：那条路是 `INSERT OR IGNORE`，幂等键命中就拒绝——
+        那是"防重复入队"的正确行为，而重试恰恰要**同一条任务再来一次**。
+
+        三条硬规矩：
+          * **重试有上限**（`max_attempts`，默认 5）：反复重试不能无限，到顶如实拒绝；
+          * **正在跑的不能重排**（`leased`/`running`）：否则同一条任务会有两个执行者；
+          * **原始层不动**：只是把这条任务的 state 改回 `pending`，已经捕获的字节一个都不碰。
+        """
+        ids = [str(t) for t in (task_ids or []) if str(t)]
+
+        def job(conn):
+            out: list[tuple[str, bool, str]] = []
+            now = time.time()
+            for tid in ids:
+                row = conn.execute(
+                    "SELECT state, attempts FROM tasks WHERE task_id = ?", (tid,)).fetchone()
+                if row is None:
+                    out.append((tid, False, "没有这个任务"))
+                    continue
+                st, att = str(row["state"]), int(row["attempts"])
+                if st in ("leased", "running"):
+                    out.append((tid, False, "任务正在跑，不能重复入队"))
+                    continue
+                if att >= int(max_attempts):
+                    out.append((tid, False, f"重试次数已达上限（{att}/{int(max_attempts)}）"))
+                    continue
+                conn.execute(
+                    "UPDATE tasks SET state = 'pending', attempts = attempts + 1, "
+                    "leased_at = NULL, lease_expires = NULL, worker_id = '', updated_at = ? "
+                    "WHERE task_id = ?", (now, tid))
+                out.append((tid, True, f"已重新入队（第 {att + 1} 次尝试）"))
+            return out
+
+        return self.writer.run_now(job, label="frontier.requeue")
+
     # ── 领取（租约）──────────────────────────────────────────────
     def claim_batch(self, n: int, worker_id: str) -> list[Task]:
         """回收过期租约 → 领 `n` 条 → 打租约。返回的任务**带着本次真实的 `leased_at`**。

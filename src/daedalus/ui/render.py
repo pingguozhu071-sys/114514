@@ -139,19 +139,33 @@ class RenderBridge:
 
     def __init__(self, parent=None, *, scheduler: RenderScheduler | None = None,
                  interval_ms: int = 50, worker=None):
-        from PySide6.QtCore import QObject, QTimer, Signal
+        from PySide6.QtCore import QObject, QTimer
         self.scheduler = scheduler or RenderScheduler()
         self._worker = worker                     # `worker(payload) -> result`
         self._deliver = None
 
-        class _Sig(QObject):
-            done = Signal(int, object)
+        class _Ready(QObject):
+            """事件投递的载体：`QApplication.postEvent` 把「结果就绪」塞进主线程事件队列。
 
-        self._sig = _Sig(parent)
+            为什么不用跨线程 `Signal`：信号那条路依赖元类型注册与连接类型推断，
+            在"payload 里塞 dict/大图"的形态下偶发 arity/类型异常，而且**投递顺序**不如
+            事件队列直观。`postEvent` 是它的等价替代，也是 Kiana 那边用血换来的写法
+            （见其交接文档：「不要改回信号机制」）。
+            """
+
+            def __init__(self, owner, gen: int, result):
+                super().__init__()
+                self.owner, self.gen, self.result = owner, gen, result
+
+            def event(self, ev) -> bool:
+                self.owner._on_done(self.gen, self.result)     # noqa: SLF001
+                return True
+
+        self._ready_cls = _Ready
+        self._host = parent if parent is not None else QObject()
         self._timer = QTimer(parent)
         self._timer.setInterval(max(16, int(interval_ms)))
         self._timer.timeout.connect(self._tick)
-        self._sig.done.connect(self._on_done, __import__("PySide6.QtCore", fromlist=["Qt"]).Qt.QueuedConnection)
 
     def on_deliver(self, fn) -> None:
         self._deliver = fn
@@ -180,8 +194,17 @@ class RenderBridge:
                 result = self._worker(payload)
             except Exception as e:                 # 工作线程异常：记下并交回主线程
                 result = {"error": f"{type(e).__name__}: {e}"}
-            # 跨线程只投递**纯数据**：QPixmap/QImage 一律在主线程里造
-            self._sig.done.emit(gen, result)
+            # 跨线程只投递**纯数据**：QPixmap/QImage 一律在主线程里造。
+            # 用 `postEvent` 而不是 `Signal`：事件队列的投递顺序确定、不依赖元类型推断。
+            try:
+                from PySide6.QtCore import QCoreApplication
+                app = QCoreApplication.instance()
+                if app is not None:
+                    app.postEvent(self._host, self._ready_cls(self, gen, result))
+                    return
+            except Exception as e:
+                logger.debug("postEvent 失败，退回直接投递：%s", e)
+            self._on_done(gen, result)             # 没有事件循环（纯逻辑测试）时直接调
 
         threading.Thread(target=run, name="dae-render", daemon=True).start()
 

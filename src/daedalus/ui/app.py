@@ -59,136 +59,136 @@ class UI:
 
 
 class MainWindow:
-    """主窗口：无边框、自绘标题栏、左导航（功能在上、设置固定底部）、右下角签名。"""
+    """主窗口：**库的 FluendWindow 骨架**（48px 标题栏 + 可折叠导航 + 300ms 切页动画）
+    + 我们自己的底图绘制 + 右下角签名。
+
+    为什么要换骨架（原来是自己画的标题栏 + 玻璃卡片导航）：自绘的那套**没有任何动效**
+    （切页是硬切、导航是硬切、悬停是硬切），机主的原话是「太硬了、一点动向都没有」。
+    FluentWindow 自带的导航展开（150ms）、切页（300ms InQuad）、全控件悬停（120ms）
+    正是设计系统报告里那句「其余交给 Fluent 组件库」的落点。
+    """
 
     @staticmethod
     def make(*, ctx: UI, tokens, app=None):
-        from PySide6.QtCore import Qt
-        from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QPushButton,
-                                       QStackedWidget, QVBoxLayout, QWidget)
+        from PySide6.QtCore import QEvent
+        from PySide6.QtGui import QColor, QPainter
+        from PySide6.QtWidgets import QApplication, QWidget
+        from qfluentwidgets import (FluentIcon, FluentWindow, NavigationItemPosition,
+                                    Theme, setTheme, setThemeColor)
+        from daedalus import VERSION, display_name
         from daedalus.ui.i18n import translator
         from daedalus.ui.pages import build_pages, page_titles
-        from daedalus.ui.widgets import (GlassCard, SignatureLabel, TitleBar, WallpaperWidget,
-                                        apply_theme)
-        from daedalus import display_name
+        from daedalus.ui.widgets import SignatureLabel, WallpaperWidget, apply_theme
 
         # 语言：**已由调用方解析好**（设置 > 安装器选择 > 系统 > en-US，见 ui/i18n.py）
         locale = str(getattr(tokens, "locale", "") or "en-US")
         t = translator(locale)
 
-        win = QWidget()
+        class _Win(FluentWindow):
+            """库窗口 + 我们自己的背景：**不调 `super().paintEvent()`**——库会把样式背景
+            画在上面，把底图盖掉；所以背景由我们全权负责（有底图画底图，没有就填主题色）。"""
+
+            def paintEvent(self, ev):                        # noqa: N802 - Qt 命名
+                if WallpaperWidget.paint(self, ev):
+                    return
+                p = QPainter(self)
+                p.fillRect(self.rect(), QColor(str(getattr(self, "_solid", "#0B0F14"))))
+                p.end()
+
+            def _geometry_changed(self) -> None:
+                cb = getattr(self, "_on_geometry", None)
+                if cb:
+                    cb()
+
+            def resizeEvent(self, ev):                       # noqa: N802
+                super().resizeEvent(ev)
+                self._geometry_changed()
+
+            def showEvent(self, ev):                         # noqa: N802
+                super().showEvent(ev)
+                self._geometry_changed()
+
+            def changeEvent(self, ev):                       # noqa: N802
+                super().changeEvent(ev)
+                if ev.type() in (QEvent.Type.ActivationChange, QEvent.Type.WindowStateChange):
+                    self._geometry_changed()
+
+        win = _Win()
         win.setObjectName("mainWindow")
         win.setWindowTitle(f"{display_name(locale)} · {t('app.title')}")
         win.setMinimumSize(MIN_W, MIN_H)
         win.resize(START_W, START_H)
-        win.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
+        win._solid = tokens.bg_solid()                        # noqa: SLF001
+        WallpaperWidget.tokens_of(win, tokens)                # 底图动效要读令牌
 
-        stack_root = QVBoxLayout(win)
-        stack_root.setContentsMargins(0, 0, 0, 0)
-        stack_root.setSpacing(0)
-
-        # ① 底图层（最底下的自立控件；内容都画在它上面）
-        bg = WallpaperWidget.make(tokens, win)
-        bg.setGeometry(0, 0, START_W, START_H)
-
-        # ② 标题栏
-        title, title_buttons = TitleBar.make(tokens, win,
-                                            title=f"{display_name(locale)} "
-                                                  f"v{__import__('daedalus').VERSION}")
-        stack_root.addWidget(title)
-
-        # ③ 主体：左导航 + 页面栈
-        body = QWidget(win)
-        body.setObjectName("bodyRow")
-        body.setAutoFillBackground(False)
-        row = QHBoxLayout(body)
-        sp = tokens.spacing()
-        row.setContentsMargins(sp["margin"] // 2, sp["gap"], sp["margin"] // 2, sp["gap"])
-        row.setSpacing(sp["gap"])
-
-        nav = GlassCard.make(tokens, name="navPanel")
-        nav.setFixedWidth(190)
-        nav_l = GlassCard.body(nav, tokens)
-        stack = QStackedWidget(body)
-        stack.setObjectName("pageStack")
-        stack.setAutoFillBackground(False)
-
+        icons = {"overview": FluentIcon.HOME, "tasks": FluentIcon.DOCUMENT,
+                 "logs": FluentIcon.SCROLL, "about": FluentIcon.INFO,
+                 "settings": FluentIcon.SETTING}
+        labels = dict(page_titles(t))
         pages = build_pages(win, tokens, ctx)
         order: list[str] = []
-        buttons: dict[str, QPushButton] = {}
-        labels: dict[str, str] = dict(page_titles(t))
+        nav_items: dict[str, object] = {}
 
-        def _add_nav(key: str, label: str, *, suffix: str = "") -> None:
-            stack.addWidget(pages[key])
-            order.append(key)
-            b = QPushButton(label + suffix, nav)
-            b.setObjectName(f"nav_{key}")
-            b.setCheckable(True)
-            b.setAutoExclusive(True)
-            b.setChecked(not order[1:])                 # 第一项默认选中
-            b.setStyleSheet(_nav_style(tokens, b.objectName()))
-            b.clicked.connect(lambda _c=False, k=key: _goto(k))
-            nav_l.addWidget(b)
-            buttons[key] = b
-
-        # 功能项在上（概览/任务/日志）→ stretch → 关于 → **设置固定最下面**
-        for key, label in page_titles(t):
-            if key in ("settings", "about"):
+        for key, label in page_titles(t):                     # 功能项在上
+            if key in ("about", "settings"):
                 continue
-            _add_nav(key, label)
-        nav_l.addStretch(1)                             # ← 把下面两项压到底部
-        _add_nav("about", labels["about"])
-        _add_nav("settings", labels["settings"], suffix="  ⚙")
-
-        row.addWidget(nav)
-        row.addWidget(stack, 1)
-        stack_root.addWidget(body, 1)
+            nav_items[key] = win.addSubInterface(pages[key], icons.get(key, FluentIcon.HOME),
+                                                 label, NavigationItemPosition.TOP)
+            order.append(key)
+        # **设置固定最下面**：库的 BOTTOM 组是「后加的在上」，所以先加关于、再加设置
+        nav_items["about"] = win.addSubInterface(pages["about"], icons["about"],
+                                                labels.get("about", "About"),
+                                                NavigationItemPosition.BOTTOM)
+        nav_items["settings"] = win.addSubInterface(pages["settings"], icons["settings"],
+                                                   labels.get("settings", "Settings"),
+                                                   NavigationItemPosition.BOTTOM)
+        order += ["settings", "about"]
+        # 导航**启动就是展开态**（带文字的导航才叫「排版」；库默认是 48px 图标条，
+        # 只有图标、没有文字，看着很空）。展开宽度照 Kiana 的 312；菜单按钮留着让用户能折叠。
+        try:
+            win.navigationInterface.setExpandWidth(312)
+            win.navigationInterface.setCollapsible(True)
+            win.navigationInterface.setMenuButtonVisible(True)
+            win.navigationInterface.expand(useAni=False)
+        except Exception as e:
+            logger.debug("导航展开失败（保持库默认的图标条）：%s", e)
 
         sig = SignatureLabel.make(tokens, win)
-
         state = {"page": order[0], "switch_ms": {}, "applied": {}, "tokens": tokens}
 
         def _goto(key: str) -> None:
+            # ⚠️ 必须每次从 `win._ui["pages"]` 现读：语言切换会**整页重建**，
+            #    闭包里抓着的旧字典指向的是已经被摘掉的旧页（实测 `switchTo` 报 index -1）。
             t0 = time.monotonic()
-            idx = order.index(key) if key in order else 0
-            stack.setCurrentIndex(idx)
-            if key in buttons:
-                buttons[key].setChecked(True)
+            page = (getattr(win, "_ui", None) or {}).get("pages", {}).get(key)
+            if page is not None:
+                win.switchTo(page)                 # 库自带 300ms 淡入淡出（动效源头）
             state["page"] = key
             state["switch_ms"][key] = round((time.monotonic() - t0) * 1000, 3)
-            ctx.settings.set("page", key) if ctx.settings is not None else None
+            if ctx.settings is not None:
+                ctx.settings.set("page", key)
 
         def _sync_vars() -> dict:
-            """窗口几何变化后同步子层（底图铺满、签名贴右下）。"""
+            """窗口几何变化后同步子层（签名贴右下 + 底图重绘）。"""
             r = win.rect()
-            bg.setGeometry(0, 0, r.width(), r.height())
             sig.adjustSize()
             sig.move(max(0, r.width() - sig.width() - 16),
                      max(0, r.height() - sig.height() - 10))
             sig.raise_()
             return {"w": r.width(), "h": r.height()}
 
-        def _on_resize(event) -> None:
+        def _on_change_handler(event=None) -> None:
             _sync_vars()
             if state.get("sched") is not None:
-                state["sched"].request({"reason": "resize"}, reason="resize")
+                state["sched"].request({"reason": "geometry"}, reason="resize")
 
-        def _on_show(event) -> None:
-            _sync_vars()
-            sig.raise_()
-
-        win.resizeEvent = _on_resize
-        win.showEvent = _on_show
-        win.changeEvent = lambda ev: (sig.raise_(), bg.lower()) if ev.type() in (
-            ev.Type.ActivationChange, ev.Type.WindowStateChange) else None
-
-        win.paintEvent = lambda ev: WallpaperWidget.paint(bg, ev)
+        win._on_geometry = _on_change_handler                  # noqa: SLF001
 
         win._ui = {"ctx": ctx, "tokens": tokens, "pages": pages, "order": order,
-                   "stack": stack, "nav": nav, "nav_layout": nav_l, "buttons": buttons,
-                   "bg": bg, "sig": sig,
-                   "title": title, "state": state, "goto": _goto, "sync": _sync_vars,
-                   "apply_theme": apply_theme}          # noqa: SLF001
+                   "stack": getattr(win, "stackedWidget", None), "nav": win.navigationInterface,
+                   "nav_items": nav_items, "buttons": nav_items, "bg": win, "sig": sig,
+                   "state": state, "goto": _goto, "sync": _sync_vars,
+                   "apply_theme": apply_theme, "icons": icons}   # noqa: SLF001
 
         # 应用外观（**所有卡片走同一个生成器**）
         info = win._ui                                  # noqa: SLF001
@@ -203,18 +203,21 @@ class MainWindow:
     # ── 运行时操作（门禁与真实使用共用）─────────────────────────
     @staticmethod
     def apply_tokens(win, tokens) -> dict:
-        """换一套令牌并**就地重刷**（主题/强调色/玻璃参数都走这里）。"""
+        """换一套令牌并**就地重刷**（主题/强调色/玻璃参数都走这里）。
+
+        导航样式不在这里刷了——导航是库的 `NavigationInterface`（它自己跟着
+        `setTheme`/`setThemeColor` 走 120ms 过渡）。这里只负责：令牌 → 样式表 + 底图色 + 签名。
+        """
         info = win._ui                                  # noqa: SLF001
         info["tokens"] = tokens
-        from daedalus.ui.pages import build_pages
+        from daedalus.ui.widgets import WallpaperWidget
         info["applied"] = info["apply_theme"](win, tokens)
-        # 导航按钮样式跟着换
-        from PySide6.QtWidgets import QPushButton
-        for key, btn in info["buttons"].items():
-            btn.setStyleSheet(_nav_style(tokens, btn.objectName()))
+        win._solid = tokens.bg_solid()                  # noqa: SLF001 - 没底图时填的纯色
+        WallpaperWidget.tokens_of(win, tokens)           # 底图动效（溶解/限帧）读这份令牌
         info["sig"].setVisible(bool(tokens.signature))
         info["sig"].setStyleSheet(f"color: {tokens.accent}; background: transparent;")
         info["sync"]()
+        win.update()
         return dict(info["applied"])
 
     @staticmethod
@@ -384,35 +387,52 @@ class MainWindow:
         from daedalus import VERSION, display_name
         from daedalus.ui.i18n import translator
         from daedalus.ui.pages import build_pages, page_titles
+        from qfluentwidgets import NavigationItemPosition
         t = translator(locale)
         if hasattr(info["tokens"], "locale"):
             info["tokens"].locale = locale               # 令牌是可变 dataclass（刻意如此）
-        stack = info["stack"]
-        while stack.count():                             # 清掉旧页（Qt 会接管对象生命周期）
-            w = stack.widget(0)
-            stack.removeWidget(w)
-            w.setParent(None)
-            w.deleteLater()
+        # 摘旧页时**屏蔽页栈信号**：库的 `_onCurrentInterfaceChanged` 会在 currentWidget 变 None
+        # 时抛 `AttributeError`（库内部没做 None 判断），刷一地红色栈回溯但功能不受影响。
+        sw = getattr(win, "stackedWidget", None)
+        try:
+            if sw is not None:
+                sw.blockSignals(True)
+            for old in list(info["pages"].values()):     # 先把旧页从导航上摘掉
+                try:
+                    win.removeInterface(old, isDelete=True)
+                except Exception as e:
+                    logger.debug("摘旧页失败（继续）：%s", e)
+        finally:
+            if sw is not None:
+                sw.blockSignals(False)
         new_pages = build_pages(win, info["tokens"], info["ctx"])
+        icons = info.get("icons") or {}
+        labels = dict(page_titles(t))
         order: list[str] = []
-        for key, _label in page_titles(t):               # 顺序与 `make` 一致：功能项 → 关于 → 设置
+        nav_items: dict[str, object] = {}
+        for key, label in page_titles(t):                # 顺序与 `make` 一致：功能项 → 设置 → 关于
             if key in ("about", "settings"):
                 continue
-            stack.addWidget(new_pages[key])
+            nav_items[key] = win.addSubInterface(new_pages[key],
+                                                 icons.get(key), label,
+                                                 NavigationItemPosition.TOP)
             order.append(key)
-        stack.addWidget(new_pages["about"])
-        order.append("about")
-        stack.addWidget(new_pages["settings"])
-        order.append("settings")
+        nav_items["about"] = win.addSubInterface(new_pages["about"], icons.get("about"),
+                                                 labels.get("about", "About"),
+                                                 NavigationItemPosition.BOTTOM)
+        nav_items["settings"] = win.addSubInterface(new_pages["settings"], icons.get("settings"),
+                                                    labels.get("settings", "Settings"),
+                                                    NavigationItemPosition.BOTTOM)
+        order += ["settings", "about"]
         info["pages"], info["order"] = new_pages, order
-        for key, btn in info["buttons"].items():         # 导航文字（含设置那枚 ⚙）
-            btn.setText(t(f"nav.{key}") + ("  ⚙" if key == "settings" else ""))
+        info["nav_items"] = nav_items
+        info["buttons"] = nav_items                      # 兼容旧键名（门禁/走查读它）
         win.setWindowTitle(f"{display_name(locale)} · {t('app.title')}")
         info["sig"].setText(t("app.signature", name=display_name(locale), version=VERSION))
         cur = info["state"].get("page")
         info["goto"](cur if cur in order else order[0])
-        return {"locale": locale, "order": order,
-                "title": win.windowTitle(), "nav": [b.text() for b in info["buttons"].values()]}
+        return {"locale": locale, "order": order, "title": win.windowTitle(),
+                "nav": [str(labels.get(k, k)) for k in order]}
 
     @staticmethod
     def goto(win, key: str) -> float:
@@ -422,12 +442,17 @@ class MainWindow:
 
     @staticmethod
     def set_wallpaper(win, image, meta: dict | None = None) -> None:
-        """设置底图（QImage；None = 回退纯色）。**只在主线程调**。"""
+        """设置底图（QImage；None = 回退纯色）。**只在主线程调**。
+
+        走 `WallpaperWidget.set_image`：换图时会有 **450ms 交叉溶解**（动效总开关管着），
+        溶解信息记在 `state["wallpaper_fade"]` 里，门禁/探针可查。
+        """
         from daedalus.ui.widgets import WallpaperWidget
         info = win._ui                                  # noqa: SLF001
-        WallpaperWidget.set_image(info["bg"], image)
+        info["state"]["wallpaper_fade"] = WallpaperWidget.set_image(info["bg"], image)
         info["state"]["wallpaper_meta"] = dict(meta or {})
         info["sync"]()
+        win.update()
 
     @staticmethod
     def refresh_pages(win, metrics: dict | None = None) -> dict:
@@ -444,7 +469,25 @@ class MainWindow:
             StatCard.set_value(cards[2], f"{int(s.get('tasks_done', 0))}/"
                                         f"{int(s.get('tasks_failed', 0))}")
             StatCard.set_value(cards[3], f"{s.get('net_latency_p95', 0) * 1000:.0f} ms")
-        EngineApp_ = None
+        # 快速采集的"运行中 N 秒"也在这一波里刷（不然状态会一直停在初始值）
+        try:
+            fn = getattr(pages["overview"], "_refresh_collect", None)
+            if callable(fn):
+                fn()
+        except Exception as e:
+            logger.debug("采集状态刷新失败：%s", e)
+        # 任务表空/非空时切换空态提示（空表旁边总要有一句话解释「为什么空」）
+        try:
+            rows = list(m.get("tasks") or [])
+            empty = getattr(pages["tasks"], "_empty_label", None)
+            if empty is not None:
+                empty.setVisible(not rows)
+            # 任务页三个操作的可用状态也跟着同步：引擎起得比窗口晚时，按钮不该永远是灰的
+            tools = getattr(pages["tasks"], "_tools", None)
+            if isinstance(tools, dict) and callable(tools.get("sync")):
+                tools["sync"]()
+        except Exception as e:
+            logger.debug("任务空态/工具行同步失败：%s", e)
         _fill_task_table(win, m.get("tasks") or [])
         return s
 
@@ -483,22 +526,14 @@ def _fill_task_table(win, rows: list) -> None:
                     table.setItem(i, c, item)          # 只在空位新建控件（不重建）
                 else:
                     table.item(i, c).setText(v)        # 有就改文本
+            # 把 task_id 挂在第 0 列的 UserRole 上：双击下钻读的就是它（pages.py 的约定）
+            from PySide6.QtCore import Qt as _Qt
+            first = table.item(i, 0)
+            if first is not None:
+                first.setData(_Qt.ItemDataRole.UserRole, str(r.get("task_id") or ""))
         table.resizeColumnsToContents()
     except Exception as e:
         logger.debug("任务表刷新失败：%s", e)
-
-
-def _nav_style(tokens, object_name: str) -> str:
-    from daedalus.ui.theme import status_colors, mix_hex
-    st = status_colors(tokens.light)
-    sp = tokens.spacing()
-    return (f"QPushButton#{object_name} {{ text-align: left; padding: {sp['inner_top']}px "
-            f"{sp['inner_bottom']}px; border: 1px solid transparent; border-radius: "
-            f"{tokens.radius // 2}px; background: transparent; color: {st['muted']}; }}\n"
-            f"QPushButton#{object_name}:hover {{ background: rgba(128,128,128,40); }}\n"
-            f"QPushButton#{object_name}:checked {{ color: {tokens.accent}; "
-            f"border: 1px solid {mix_hex(tokens.accent, '#FFFFFF', 0.4)}; "
-            f"background: rgba(128,128,128,30); }}")
 
 
 def build_headless(*, engine=None, data_root=None, tokens=None):

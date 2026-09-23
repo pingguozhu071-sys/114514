@@ -105,10 +105,20 @@ class Drilldown:
         return self._one(lambda c: [dict(r) for r in c.execute(
             "SELECT state, COUNT(*) AS n FROM tasks GROUP BY state").fetchall()])
 
-    def _rows_artifacts_export(self, lim: int) -> list[dict]:
-        return self._one(lambda c: [dict(r) for r in c.execute(
-            "SELECT sha256, url, size, mime, status, source, parent_task, path, note, "
-            "fetched_at FROM raw_artifacts ORDER BY fetched_at LIMIT ?", (lim,)).fetchall()])
+    def _rows_artifacts_export(self, lim: int, ids: list[str] | None = None) -> list[dict]:
+        """原始产物行。给了 `ids` 就按 `parent_task` **逐条参数化**取（不拼 `IN`）。"""
+        if not ids:
+            return self._one(lambda c: [dict(r) for r in c.execute(
+                "SELECT sha256, url, size, mime, status, source, parent_task, path, note, "
+                "fetched_at FROM raw_artifacts ORDER BY fetched_at LIMIT ?", (lim,)).fetchall()])
+        out: list[dict] = []
+        for tid in list(ids)[:lim]:
+            rows = self._one(lambda c, t=str(tid): [dict(r) for r in c.execute(
+                "SELECT sha256, url, size, mime, status, source, parent_task, path, note, "
+                "fetched_at FROM raw_artifacts WHERE parent_task = ? ORDER BY fetched_at",
+                (t,)).fetchall()])
+            out.extend(rows or [])
+        return out
 
     def _rows_pages_export(self, lim: int) -> list[dict]:
         """派生层导出（含指纹）：**指纹可见**的兑现点之一。"""
@@ -201,25 +211,69 @@ class Drilldown:
                 counts["failed"] += n
         return counts
 
-    def export_jsonl(self, *, limit: int = 10000) -> str:
-        """全量导出（JSONL：一行一条，可 diff / 可 jq / 可回归对比）。
+    def export_jsonl(self, *, limit: int = 10000, task_ids=None) -> str:
+        """导出（JSONL：一行一条，可 diff / 可 jq / 可回归对比）。
 
         包含 `page` 行（带 **content_hash / simhash**）——这是「指纹可见」的落地：
-        导出的东西必须能自证"这条记录是谁"，否则离线核对时无从比对。
+        导出的东西必须能自证「这条记录是谁」，否则离线核对时无从比对。
+
+        `task_ids` 给了就**只导这几条任务**（界面上的「导出选中」）：
+        * `tasks` 按 id 逐条取；`raw_artifacts` 按它自己的 `parent_task` 列取（产物挂在任务下）；
+        * **`pages` 不按任务过滤**——那张表按 `url_hash` 建键、没有任务归属列，
+          硬凑只会把别人的记录也导出来。所以选中导出时**不导 pages**，并在首行写明原因。
         """
         lim = max(1, min(int(limit), 50000))
+        ids = [str(t) for t in (task_ids or []) if str(t)]
         out: list[str] = [json.dumps({"kind": "ledger", "counts": self.ledger_counts()},
                                      ensure_ascii=False, sort_keys=True)]
-        for t in self.tasks_overview(limit=lim):
+        if ids:
+            out.append(json.dumps({"kind": "note", "scope": "selected_tasks", "task_ids": ids,
+                                   "pages_omitted": True,
+                                   "why": "pages 表按 url_hash 建键、没有任务归属列，"
+                                          "选中导出只含任务行与它的原始产物"},
+                                  ensure_ascii=False, sort_keys=True))
+        for t in self._rows_tasks_export(lim, ids):
             out.append(json.dumps({"kind": "task", **t}, ensure_ascii=False, sort_keys=True,
                                   default=str))
-        for pg in self._rows_pages_export(lim):
-            out.append(json.dumps({"kind": "page", **pg}, ensure_ascii=False, sort_keys=True,
-                                  default=str))
-        for a in self._rows_artifacts_export(lim):
+        if not ids:
+            for pg in self._rows_pages_export(lim):
+                out.append(json.dumps({"kind": "page", **pg}, ensure_ascii=False, sort_keys=True,
+                                      default=str))
+        for a in self._rows_artifacts_export(lim, ids):
             out.append(json.dumps({"kind": "artifact", **a}, ensure_ascii=False, sort_keys=True,
                                   default=str))
         return "\n".join(out)
+
+    def _rows_tasks_export(self, lim: int, ids: list[str]) -> list[dict]:
+        """导出的任务行（给了 ids 就只导这几条）。
+
+        实现上**逐条参数化查询**，不动态拼 `IN (?,?,?)`——本工程纪律是「SQL 必须是字符串
+        字面量」，拼接占位符列表会被 lint 按注入形状拦下（拦得对：开了这个口子，
+        下一个人就会顺手把值也拼进去）。选中任务最多几百条，本地 SQLite 上逐条查可忽略。
+        """
+        conn = self.db.connect(readonly=True)
+        try:
+            if ids:
+                rows: list[dict] = []
+                for tid in ids[:lim]:
+                    r = conn.execute(
+                        "SELECT task_id, kind AS task_kind, target, goal, state, attempts, "
+                        "throttles, "
+                        "transitions, bytes_done, created_at, updated_at FROM tasks "
+                        "WHERE task_id = ?", (str(tid),)).fetchone()
+                    if r is not None:
+                        rows.append(dict(r))
+                return rows
+            got = conn.execute(
+                "SELECT task_id, kind AS task_kind, target, goal, state, attempts, throttles, "
+                "transitions, bytes_done, created_at, updated_at FROM tasks "
+                "ORDER BY updated_at DESC LIMIT ?", (lim,)).fetchall()
+            return [dict(r) for r in got]
+        except Exception as e:
+            logger.debug("导任务行失败：%s", e)
+            return []
+        finally:
+            conn.close()
 
     # ── 能力探测（表不存在时**如实说**，不抛异常）───────────────
     def _has_deadletter(self) -> bool:

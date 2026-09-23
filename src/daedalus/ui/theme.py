@@ -225,7 +225,26 @@ class Tokens:
         # 铁律：**卡片间距必须大于卡内最大间距**，否则分组感会消失
         if out["gap"] <= max(out["inner"]):
             out["gap"] = max(out["inner"]) + 4
+        # 页面**下边距小于上边距**（规格 28/28/28/20）：滚到底时不留一大块空白
+        out["margin_bottom"] = max(10, int(out["margin"] * 0.7))
         return out
+
+    # ── 动效（令牌 → 实际时长；总开关关掉就返回 0，调用方**直接落终值**）──
+    def anim_ms(self, ms: int) -> int:
+        """动效时长。`animations=False` 返回 0——不是「跳过动画」，是「立刻到终态」。"""
+        return int(ms) if self.animations else 0
+
+    def frame_min_ms(self) -> int:
+        """限帧：全窗重绘动画每帧至少间隔这么多毫秒（默认 30fps → 33ms）。"""
+        return max(1, int(1000 / max(1, int(self.fps_cap))))
+
+    def hover_ms(self) -> int:
+        """微交互（悬停/按下）时长：120ms（与 Fluent 组件库同源）。"""
+        return self.anim_ms(120)
+
+    def roll_ms(self) -> int:
+        """统计数字滚动时长：360ms（略长于微交互，读感自然）。"""
+        return self.anim_ms(360)
 
     def bg_solid(self) -> str:
         return "#F5F6F8" if self.light else "#0B0F14"
@@ -256,25 +275,39 @@ def tokens(**kw) -> Tokens:
 
 # ── 玻璃层 QSS 生成器（**同页所有卡片都走这一个函数**）──────────────
 def panel_qss(alpha: int | None = None, light: bool = False, radius: int = 12,
-              accent: str = "#4FA3E8", object_name: str = "panel") -> str:
+              accent: str = "#4FA3E8", object_name: str = "panel",
+              hover: float = 0.0) -> str:
     """生成玻璃层样式。
 
-    * 竖向渐变（上亮下暗一点点）+ 1px **固定**描边 + 圆角；
+    * 竖向渐变（**上实下透**）+ 1px **固定**描边 + 圆角；
     * 透明度由**唯一参数** `alpha`（40–95）控制；
-    * 深色描边 `rgba(255,255,255,22)`／浅色 `rgba(0,0,0,14)`——**不随 alpha 变**。
+    * 深色描边 `rgba(255,255,255,22)`／浅色 `rgba(0,0,0,14)`——**不随 alpha 变**
+      （描边是「卡片边界」的语义，不是装饰；跟着 alpha 变会让边界在高透明时消失）；
+    * `hover`（0–1）只把**渐变与描边稍微提亮**，用于悬停反馈——0 时输出与不带该参数完全一致。
+
+    色值照着 Kiana 的规格来：深色是**冷灰**（`rgba(30,37,46,·)` → `rgba(18,23,30,·)`，
+    基准 235/185，即「顶部更实、底部更透」），浅色是同一色相的白色族（242/220 基准）。
+    为什么不用「白纱 → 纯黑」：那样卡片上半发灰白、下半发黑，既脏又没有体积感（实测截图很难看）。
+    乘法换算（而不是区间映射）保住了 235:185 的比例，任何 alpha 下立体感都不变。
     """
     a = int(_clamp(95 if alpha is None else alpha, 40, 95)) / 100.0
+    h = _clamp(float(hover), 0.0, 1.0)
+    lift = int(6 * h)                       # 悬停提亮幅度（1–6/255，够察觉又不刺眼）
     if light:
-        top = f"rgba(255,255,255,{a:.3f})"
-        bottom = f"rgba(246,247,250,{min(1.0, a + 0.03):.3f})"
-        border = "rgba(0,0,0,14)"
+        top = f"rgba(255,255,255,{min(255, int(242 * a) + lift)})"
+        bottom = f"rgba(255,255,255,{min(255, int(220 * a) + lift)})"
+        border = ("rgba(0,0,0,14)" if h <= 0
+                  else f"rgba(0,0,0,{int(14 + 12 * h)})")
         text = "#12161C"
     else:
-        top = f"rgba(255,255,255,{a * 0.10:.3f})"
-        bottom = f"rgba(12,16,22,{min(1.0, a / 100.0):.3f})"
-        border = "rgba(255,255,255,22)"
+        top = f"rgba({30 + lift},{37 + lift},{46 + lift},{int(235 * a)})"
+        bottom = f"rgba({18 + lift},{23 + lift},{30 + lift},{int(185 * a)})"
+        border = ("rgba(255,255,255,22)" if h <= 0
+                  else f"rgba(255,255,255,{int(22 + 16 * h)})")
         text = "#EAF0F6"
-    sel = mix_hex(accent, "#FFFFFF", 0.55 if light else 0.25)
+    # 选中态**不许用强调色**（强调色是留给「当前所在位置/开关/主按钮」的语义色，
+    # 一旦描边也用它，整屏都是彩色，重点会消失）。这里只提高中性描边的浓度。
+    sel_border = "rgba(0,0,0,26)" if light else "rgba(255,255,255,38)"
     return f"""
 #{object_name} {{
     background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
@@ -284,12 +317,17 @@ def panel_qss(alpha: int | None = None, light: bool = False, radius: int = 12,
     color: {text};
 }}
 #{object_name}[selected="true"] {{
-    border: 1px solid {sel};
+    border: 1px solid {sel_border};
 }}
 """
 
 
-def card_qss(t: Tokens, object_name: str = "card") -> str:
+def text_color(light: bool = False) -> str:
+    """卡片/页面上的主文字色（与 `panel_qss` 的 `color` 同源，别在控件里另写一个）。"""
+    return "#12161C" if light else "#EAF0F6"
+
+
+def card_qss(t: Tokens, object_name: str = "card", hover: float = 0.0) -> str:
     """卡片样式 = 同一生成器 + 令牌（**别在这里另写一套颜色**）。"""
     return panel_qss(t.card_alpha(), light=t.light, radius=t.radius, accent=t.accent,
-                     object_name=object_name)
+                     object_name=object_name, hover=hover)

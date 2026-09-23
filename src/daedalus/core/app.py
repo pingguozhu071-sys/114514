@@ -28,6 +28,7 @@ from daedalus.core.budget import Budget
 from daedalus.core.limits import ResourcePlan
 from daedalus.core.lifecycle import InflightRegistry, ShutdownChain
 from daedalus.obs.metrics import METRICS
+from daedalus.obs.logs import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -200,10 +201,14 @@ class EngineApp:
     # ── 采集 ────────────────────────────────────────────────────
     def run_targets(self, urls, *, workers: int = 4, budget: Budget | None = None,
                     goal: str = "", idle_timeout: float = 300.0,
-                    deadline: float | None = None) -> RunSummary:
+                    deadline: float | None = None,
+                    stop_event: "threading.Event | None" = None) -> RunSummary:
         """把一批 URL 变成任务跑完（多线程领取直到前沿空）。
 
         `workers` 是**领取线程数**；每个任务内部的资源开销由资源计划与预算管着。
+        `stop_event` 是**可选中止**：界面上的「停止」把它 set 上，worker 在下一轮领取前退出
+        （`summary.stopped_early=True`）。**已领走的租约不丢**——要么跑完、要么按租约超时
+        回到队列，下次继续；中止不等于丢任务。
 
         ⚠️ 收工条件（S9 门禁跑出来的真 bug）：**队列空 + 没有在飞任务** 才退出。
         曾经写成"空手就等到 idle_timeout（默认 300s）"——于是 `daedalus collect URL`
@@ -234,6 +239,12 @@ class EngineApp:
             last_probe = 0.0
             while True:
                 if stop_at is not None and time.monotonic() >= stop_at:
+                    with lock:
+                        summary.stopped_early = True
+                    return
+                # 界面的「停止」：下一轮领取前退出。**已经领走的租约不丢**——
+                # 要么跑完，要么按租约超时回到队列，下次接着做（中止不是"丢任务"）。
+                if stop_event is not None and stop_event.is_set():
                     with lock:
                         summary.stopped_early = True
                     return
@@ -436,6 +447,84 @@ class EngineApp:
 
     def export_jsonl(self, limit: int = 10000) -> str:
         return self.drilldown.export_jsonl(limit=limit)
+
+    # ── 任务级的三个操作（界面「任务」页的按钮走这里）──────────────
+    def retry_tasks(self, task_ids, *, max_attempts: int = 5) -> dict:
+        """把选中的任务**重新排回队列**（重试）。原始层不动，只是让它们再跑一次。
+
+        * 重试**有上限**（默认 5 次，见 `frontier.requeue`）：反复重试不能无限；
+        * 正在跑的会被拒（同一条任务不能有两个执行者）；
+        * 每一条的结果都**如实带回**（成功/失败原因），不做「批量假装成功」。
+        """
+        ids = [str(t) for t in (task_ids or []) if str(t)]
+        if not ids:
+            return {"requested": 0, "ok": 0, "results": [], "note": "没有选中任何任务"}
+        rows = self.frontier.requeue(ids, max_attempts=max_attempts)
+        ok = sum(1 for _tid, good, _why in rows if good)
+        for tid, good, why in rows:
+            log_event(logger, "task.retry" if good else "task.retry_rejected",
+                      f"重试 {tid}：{why}", task_id=tid,
+                      level=logging.INFO if good else logging.WARNING)
+        METRICS.inc("app.tasks_retried", ok)
+        return {"requested": len(ids), "ok": ok,
+                "results": [{"task_id": t, "ok": g, "why": w} for t, g, w in rows]}
+
+    def export_tasks_jsonl(self, task_ids, *, limit: int = 2000) -> str:
+        """导出选中任务的结果（JSONL）。与 CLI `export` **同一实现**，因此**同样过脱敏**。"""
+        ids = [str(t) for t in (task_ids or []) if str(t)]
+        log_event(logger, "task.export", f"导出选中任务 {len(ids)} 条", n=len(ids))
+        return self.drilldown.export_jsonl(limit=limit, task_ids=ids)
+
+    def forget_tasks(self, task_ids, *, dry_run: bool = True) -> dict:
+        """删除任务记录（tasks + task_evidence + 该任务的 errors）。
+
+        **捕获面不可变**——这是本工程的地基，所以这里划死三条：
+          * `raw_artifacts` / `pages` / `extracted` / `downloads` **一个字节都不删**
+            （原始层是地面真值，派生层可重算；要清理原始层请用专门的工具，别走这里）；
+          * `dry_run=True` 是默认值：先自证「我会删多少行」，不信就不执行；
+          * 删除**留痕**（结构化日志 `task.forgotten` + 指标计数），事后能查「什么时候删了什么」。
+        """
+        ids = [str(t) for t in (task_ids or []) if str(t)]
+        if not ids:
+            return {"dry_run": bool(dry_run), "requested": 0, "deleted": {},
+                    "note": "没有选中任何任务"}
+
+        counts = {"tasks": 0, "task_evidence": 0, "errors": 0}
+
+        def job(conn):
+            for tid in ids:
+                row = conn.execute("SELECT state FROM tasks WHERE task_id = ?", (tid,)).fetchone()
+                if row is None:
+                    continue
+                if str(row["state"]) in ("leased", "running"):
+                    # 正在跑的任务不能删（它的 worker 还在写证据行，删了会留下孤儿证据）
+                    continue
+                if dry_run:
+                    r1 = conn.execute(
+                        "SELECT COUNT(*) AS n FROM task_evidence WHERE task_id = ?",
+                        (tid,)).fetchone()
+                    counts["task_evidence"] += int((r1["n"] if r1 else 0))
+                    r2 = conn.execute(
+                        "SELECT COUNT(*) AS n FROM errors WHERE task_id = ?", (tid,)).fetchone()
+                    counts["errors"] += int((r2["n"] if r2 else 0))
+                    counts["tasks"] += 1
+                    continue
+                conn.execute("DELETE FROM task_evidence WHERE task_id = ?", (tid,))
+                conn.execute("DELETE FROM errors WHERE task_id = ?", (tid,))
+                conn.execute("DELETE FROM tasks WHERE task_id = ?", (tid,))
+                counts["tasks"] += 1
+            return counts
+
+        got = self.writer.run_now(job, label="app.forget_tasks")
+        if not dry_run:
+            log_event(logger, "task.forgotten",
+                      f"删除任务记录：{got['tasks']} 条（原始层未动）",
+                      level=logging.WARNING, n_tasks=got["tasks"],
+                      n_evidence=got["task_evidence"], n_errors=got["errors"])
+            METRICS.inc("app.tasks_forgotten", got["tasks"])
+        return {"dry_run": bool(dry_run), "requested": len(ids), "deleted": got,
+                "raw_untouched": True,
+                "note": "只删任务/证据/错误行；原始层（raw_artifacts）与派生层不动"}
 
     # ── 收尾 ────────────────────────────────────────────────────
     def shutdown(self) -> dict:

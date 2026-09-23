@@ -72,7 +72,7 @@ def walk(*, verbose: bool = True) -> dict:
     # **把模态对话框打桩**：无头环境里真弹窗会永久阻塞（走查第一次就卡在这）。
     # 打桩之后反而更好——预设保存/导出/导入/选文件这几条**真代码路径**都会被走到，
     # 只是「用户点了确定/选了这个文件」这一步由桩给出确定答案。
-    from PySide6.QtWidgets import QFileDialog, QInputDialog
+    from PySide6.QtWidgets import QFileDialog, QInputDialog, QMessageBox
     preset_out = root / "walk_presets.json"
     QInputDialog.getText = staticmethod(lambda *a, **k: ("走查预设2", True))
     QFileDialog.getSaveFileName = staticmethod(lambda *a, **k: (str(preset_out), ""))
@@ -82,6 +82,9 @@ def walk(*, verbose: bool = True) -> dict:
         return (str(preset_out) if ("预设" in title or "preset" in title.lower())
                 else str(noise), "")
     QFileDialog.getOpenFileName = staticmethod(_open_stub)
+    # 「删除任务记录」的确认框：默认**点「否」**（走查先验"没确认不许删"这条路）。
+    # 需要验「是」的分支时，测试里再把这个桩改成 Yes。
+    QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.StandardButton.No)
 
     b = build_headless(data_root=root, tokens=mk_tokens(locale="zh-CN"))
     win, app, store = b["window"], b["app"], b["settings"]
@@ -120,11 +123,13 @@ def walk(*, verbose: bool = True) -> dict:
         app.processEvents()
         return store.get(key)
 
+    # 注意：`expert_mode` **不在**这里——它没有实现，已从设置界面移除（假开关比没有更坏）。
+    # 新加的 `log_autoscroll` 在这里验：它是日志页「自动滚动」的真开关。
     cases = [("panel_alpha", 88), ("blur", 12), ("dim_manual", 20), ("light", True),
              ("signature", False), ("density", "relaxed"), ("font_pt", 12.0),
              ("focus", "top"), ("animations", False), ("fade_ms", 300),
              ("debounce_ms", 400), ("fps_cap", 60), ("downsample_max", 1920),
-             ("expert_mode", True), ("accent_locked", True)]
+             ("log_autoscroll", False), ("accent_locked", True)]
     bad = []
     for key, val in cases:
         got = _apply_now(key, val)
@@ -297,12 +302,64 @@ def walk(*, verbose: bool = True) -> dict:
           f"{before[:1]} → {after[:1]}；轮询耗时 {rec.get('last_ms', 0):.1f}ms"
           f"（超 {MainWindow.SLOW_MS}ms 会自动降频到 {MainWindow.POLL_MS_BACKOFF}ms）")
 
+    # ── K. 任务页的三个真操作（重试 / 导出选中 / 删除记录）────────────
+    from daedalus.ui.app import MainWindow as _MW
+    _MW.refresh_pages(win, {"summary": {}, "tasks": [
+        {"task_id": "w-t1", "state": "dead", "target": "https://e.test/a?token=SEKRET1",
+         "attempts": 3, "content_hash": "ef" * 32},
+        {"task_id": "w-t2", "state": "failed", "target": "https://e.test/b",
+         "attempts": 1, "content_hash": "12" * 32}]})
+    app.processEvents()
+    tp = ui["pages"]["tasks"]
+    tools, table = getattr(tp, "_tools", None), getattr(tp, "_table", None)
+
+    class _WalkEngine:
+        """桩引擎：记录被调了什么，导出走**真实现**的脱敏口径（与 CLI 同源）。"""
+
+        def __init__(self):
+            self.retried, self.exported, self.dry, self.forgot = [], [], [], []
+
+        def retry_tasks(self, ids, **kw):
+            self.retried.append(list(ids))
+            return {"requested": len(ids), "ok": len(ids),
+                    "results": [{"task_id": i, "ok": True, "why": "ok"} for i in ids]}
+
+        def export_tasks_jsonl(self, ids, **kw):
+            self.exported.append(list(ids))
+            return '{"kind":"task","target":"https://e.test/a?token=[REDACTED]"}\n'
+
+        def forget_tasks(self, ids, dry_run=True, **kw):
+            (self.dry if dry_run else self.forgot).append(list(ids))
+            return {"dry_run": dry_run, "deleted": {"tasks": len(ids), "task_evidence": 1,
+                                                    "errors": 0}}
+
+    stub = _WalkEngine()
+    ui["ctx"].engine = stub
+    if tools and table and table.rowCount() >= 1:
+        table.selectRow(0)
+        app.processEvents()
+        tools["retry"].click()
+        app.processEvents()
+        tools["export"].click()          # 保存对话框已在上面打桩 → 真写文件
+        app.processEvents()
+        tools["forget"].click()          # 确认框桩成「否」→ 一个都不许删
+        app.processEvents()
+        check("任务页三操作都真的调了引擎（重试/导出/删除）",
+              stub.retried == [["w-t1"]] and stub.exported == [["w-t1"]],
+              f"重试={stub.retried} 导出={stub.exported}")
+        check("删除：没点「是」就一行都不删（红线）", not stub.forgot and not stub.dry,
+              f"dry={stub.dry} 实删={stub.forgot}")
+    else:
+        check("任务页三操作走查可用", False, "没有工具行或表格为空")
+    ui["ctx"].engine = None
+
     total = len(RESULTS)
     failed = [r for r in RESULTS if not r["ok"]]
     return {"total": total, "failed": len(failed), "ok": not failed,
             "results": RESULTS, "locale_detected": b["tokens"].locale,
             "note": "界面实操走查（offscreen）：逐页进入 + 每个控件走真实信号 + 背景图真路径 + "
-                    "三张特征图取色 + Kiana 间距规格 + 几何不重叠 + 语言不混 + 按钮全点一遍"}
+                    "三张特征图取色 + Kiana 间距规格 + 几何不重叠 + 语言不混 + 按钮全点一遍 + "
+                    "任务页三操作（重试/导出/删除确认）"}
 
 
 def main(argv: list[str] | None = None) -> int:
