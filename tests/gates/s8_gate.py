@@ -345,7 +345,7 @@ def t_boundary_no_adversarial():
                   if i not in doc_lines and not ln.strip().startswith("#")]
     code = "\n".join(code_lines)
     banned = ("webdriver", "stealth.min.js", "navigator.plugins", "AutomationControlled",  # noqa: lint -- 扫描器词表
-              "captcha", "打码", "指纹伪装", "轮换出口", "proxy_rotat", "humaniz", "拟人")
+              "captcha", "打码", "指纹伪装", "轮换出口", "proxy_rotat", "humaniz", "拟人")  # noqa: lint -- 扫描器词表
     found = [b for b in banned if b.lower() in code.lower()]
     assert not found, f"可执行代码里出现对抗性关键词：{found}"
     # 边界**必须写在文件头**（不然下一个人可能顺手加上去）
