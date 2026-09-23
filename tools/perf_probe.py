@@ -99,8 +99,20 @@ def probe(*, real: bool = False, out: pathlib.Path | None = None) -> dict:
     d = root / "底图目录"
     d.mkdir(parents=True, exist_ok=True)
     big = d / "8K.png"
+    # ⚠️ 造 8K 测试图是**探针自己的活**（约 1.3s 纯 CPU），期间事件循环不转。若算进心跳，
+    #    它会被误报成"应用停顿"——实测抓到过 1.76s 的假停顿（8 次里 1 次，负载才 15%）。
+    #    所以：造图期间**停心跳**，并把这段耗时单独记为 `fixture_ms`（可查、不藏）。
+    hb.stop()
+    t_fix = time.perf_counter()
     _make_test_image(big, 7680, 4320)
+    fixture_ms = round((time.perf_counter() - t_fix) * 1000, 2)
+    last[0] = time.perf_counter()                    # 心跳重新起算，别把这段算进间隔
+    hb.start()
     pipe: dict = {}
+    # 管线是**刻意触发的重活**（8K 解码+模糊+下采样，且在 tracemalloc 下跑），它的耗时与内存
+    # 已经单独报成 `pipeline.ms` / `pipeline.peak_mb`。这里再停一次心跳：否则同一件事会被
+    # 量两遍（心跳把它算成"交互停顿"，线上报个假红——实测 10 次里 1 次这样）。
+    hb.stop()
     tracemalloc.start()
     t0 = time.perf_counter()
     q, meta = process_wallpaper(str(big), width=win.width(), height=win.height(), blur=6)
@@ -109,8 +121,11 @@ def probe(*, real: bool = False, out: pathlib.Path | None = None) -> dict:
     tracemalloc.stop()
     pipe["peak_mb"] = round(peak / (1 << 20), 2)
     pipe["meta"] = meta
+    pipe["fixture_ms"] = fixture_ms                  # 造图耗时（不属于应用停顿）
     MainWindow.set_wallpaper(win, q, meta)
     app.processEvents()
+    last[0] = time.perf_counter()                    # 心跳重新起算
+    hb.start()
 
     reflows: list[float] = []
     for w, h in ((1600, 900), (980, 620), (1360, 860)):

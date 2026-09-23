@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
-"""打包态 GUI 真窗口截图：验"装完之后界面到底是什么语言、长什么样"。
+"""打包态 GUI 真窗口截图：验「装完之后界面到底是什么语言、长什么样」。
 
     python tools/grab_frozen.py --lang 2052 --out out/ui_shots/frozen_zh.png
     python tools/grab_frozen.py --lang 1041 --out out/ui_shots/frozen_ja.png
 
-**为什么要这个工具**：源码态的截图（`tools/ui_shot.py`）证明不了"装到机器上的那个 exe 是不是
-本机语言"——而机主的原话就是"安装时选了简体，装完别给我蹦日文"。所以这里**真启动 dist 里的
+**为什么要这个工具**：源码态的截图（`tools/ui_shot.py`）证明不了「装到机器上的那个 exe 是不是
+本机语言」——而机主的原话就是「安装时选了简体，装完别给我蹦日文」。所以这里**真启动 dist 里的
 那个 exe**（带 `install.marker` 的 `lang=`，模拟安装器写下的选择），抓它的**真窗口**像素。
 
 启动方式**就是用户双击那种**（`os.startfile`：不经 shell、不拼命令行），进程靠 `psutil`
-按"启动时间 + 进程名"认领——因此本工具**不接收任何"要执行哪个程序"的参数**。
+按「启动时间 + 进程名」认领——因此本工具**不接收任何「要执行哪个程序」的参数**。
 
 流程：写 marker → 启动 exe → 等窗口出现 → 按 PID 找窗口矩形 → 截图 → 关掉。
 """
@@ -32,7 +32,7 @@ __all__ = ["grab"]
 def _print_window(hwnd: int, w: int, h: int):
     """抓**窗口自己的表面**（`PrintWindow` + PW_RENDERFULLCONTENT）。
 
-    比"截屏那块矩形"可靠：截屏会被别的窗口盖住——第一次跑就是这样，抓到的是另一个应用的
+    比「截屏那块矩形」可靠：截屏会被别的窗口盖住——第一次跑就是这样，抓到的是另一个应用的
     对话框（`SetForegroundWindow` 在 Windows 上经常被系统拒绝，前台窗口根本不是我们启的那个）。
     """
     import cv2
@@ -78,7 +78,7 @@ def _dpi_aware() -> None:
 
 
 def _launched_pid(name: str, since: float) -> int | None:
-    """认领"刚刚被本工具启动的那个进程"：进程名匹配且创建时间晚于 since。"""
+    """认领「刚刚被本工具启动的那个进程」：进程名匹配且创建时间晚于 since。"""
     import psutil
     for p in psutil.process_iter(["name", "create_time"]):
         try:

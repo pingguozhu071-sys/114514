@@ -92,7 +92,7 @@ def count_pages(path) -> int:
 
 
 class _AppStack:
-    """注入用的"测试 app"：真组件 + 假咽喉（与基准/长跑同一套闭环）。"""
+    """注入用的「测试 app」：真组件 + 假咽喉（与基准/长跑同一套闭环）。"""
 
     def __init__(self, root: pathlib.Path, *, shell_urls=()):
         from _harness import BenchPayload, build_offline_stack
@@ -225,7 +225,7 @@ class _AppStack:
 
 def with_app(fn, *, shell_urls=(), name="s9", root=None):
     """装好注入 app 跑一段。`root` 可显式指定（**跨命令共用一个数据根**时要用它，
-    例如"先 collect 再 reparse"——两次调用必须是同一个数据根，否则重扫的是空库）。"""
+    例如「先 collect 再 reparse」——两次调用必须是同一个数据根，否则重扫的是空库）。"""
     from daedalus import cli
     r = pathlib.Path(root) if root is not None else \
         (_TMP / f"{name}_{abs(hash(fn.__name__)) % 10000}")

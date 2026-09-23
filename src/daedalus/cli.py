@@ -43,7 +43,7 @@ EXIT_BLOCKED = 3
 EXIT_INTERNAL = 4
 
 _JSON_STATE = {"json": False}
-# 测试注入点：门禁要离线驱动 CLI（不联网），所以允许替换"怎么造 app"。
+# 测试注入点：门禁要离线驱动 CLI（不联网），所以允许替换「怎么造 app」。
 # 产品默认永远是 `EngineApp.build`（真咽喉、真库、真闭环）。
 _INJECT: dict = {"factory": None}
 

@@ -6,7 +6,7 @@
     python tools/ui_shot.py --wallpaper 图.png   # 指定底图（默认自动造一张测试图）
     python tools/ui_shot.py --pages overview,tasks
 
-为什么要有这个工具：**offscreen 平台的断言能证明"没崩、参数生效"，但证明不了"好不好看/挤不挤"**。
+为什么要有这个工具：**offscreen 平台的断言能证明「没崩、参数生效」，但证明不了「好不好看/挤不挤」**。
 界面验收必须看图。所以把每页渲成 PNG，由人（或子代理）真的看一眼，再决定改哪儿。
 （`QT_QPA_PLATFORM=offscreen`：无显示器也能渲。）
 """
@@ -26,7 +26,7 @@ __all__ = ["shoot"]
 
 
 def _make_test_wallpaper(path: pathlib.Path, w: int = 1920, h: int = 1080) -> pathlib.Path:
-    """造一张"真实感"测试底图：渐变 + 亮/暗块 + 高饱和色块（考文字可读性与取色）。"""
+    """造一张「真实感」测试底图：渐变 + 亮/暗块 + 高饱和色块（考文字可读性与取色）。"""
     import cv2
     import numpy as np
     rng = np.random.default_rng(7)

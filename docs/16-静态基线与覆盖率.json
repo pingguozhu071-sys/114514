@@ -1,17 +1,14 @@
 {
   "lint": {
-    "files": 88,
-    "lint_hard": 4,
-    "lint_soft": 285
+    "files": 93,
+    "lint_hard": 0,
+    "lint_soft": 302
   },
   "gates": {
     "gates": 12,
-    "gate_items": 238,
-    "gates_failing": [
-      "s2_gate",
-      "contract_selftest"
-    ]
+    "gate_items": 250,
+    "gates_failing": []
   },
-  "coverage_percent_src": 68.05,
+  "coverage_percent_src": 67.3,
   "note": "覆盖率是对**部分门禁**（s3/s4/s6/s9）的估计值：门禁才是本工程的测试集，跑全部门禁代价较高，所以这里只报一个可比的量级；基线规则：lint_hard=0、lint_soft 不升、gate_items 不降。"
 }

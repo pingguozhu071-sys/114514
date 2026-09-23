@@ -4,16 +4,16 @@
     python tools/ui_walk.py            # 人类可读
     python tools/ui_walk.py --json     # 机器可读（门禁吃它）
 
-为什么要有它：机主原话是"你测试一下它的 UI 样式…别犯低级错误""背景图选文件、还有自动取色
-那些杂七杂八的都测一下"。所以这里**不是**看代码，而是把控件当用户去用：
+为什么要有它：机主原话是「你测试一下它的 UI 样式…别犯低级错误」「背景图选文件、还有自动取色
+那些杂七杂八的都测一下」。所以这里**不是**看代码，而是把控件当用户去用：
   * 逐页进入 → 断言页面真的被换上去、内容非空；
   * 逐个设置控件 → 走真实的信号路径（改值 → `_apply` → 存盘 → 重刷），断言生效；
-  * **背景图**：走"选文件 → 文本框 → editingFinished"这条真路径（文件对话框在无头环境没法弹，
+  * **背景图**：走「选文件 → 文本框 → editingFinished」这条真路径（文件对话框在无头环境没法弹，
     但它选完也就做这两件事），断言管线跑过、元数据落进窗口状态、设置被保存；
   * **自动取色**：给三张特征图（紫/灰/彩噪）断言取到预期色或**如实回退并说明**；
   * **不拥挤**（照 Kiana 规格）：间距数字逐项核对 + 卡片几何不重叠 + 卡片间距 > 卡内间距；
   * **不混语言**：切到 ja-JP / en-US 后，断言界面上不再出现 zh-CN 的专属文案
-    （机主点名的"装完蹦日文/中文混着"那类低级错误）。
+    （机主点名的「装完蹦日文/中文混着」那类低级错误）。
 退出码 0 = 全部通过。
 """
 
@@ -71,7 +71,7 @@ def walk(*, verbose: bool = True) -> dict:
 
     # **把模态对话框打桩**：无头环境里真弹窗会永久阻塞（走查第一次就卡在这）。
     # 打桩之后反而更好——预设保存/导出/导入/选文件这几条**真代码路径**都会被走到，
-    # 只是"用户点了确定/选了这个文件"这一步由桩给出确定答案。
+    # 只是「用户点了确定/选了这个文件」这一步由桩给出确定答案。
     from PySide6.QtWidgets import QFileDialog, QInputDialog
     preset_out = root / "walk_presets.json"
     QInputDialog.getText = staticmethod(lambda *a, **k: ("走查预设2", True))
@@ -132,7 +132,7 @@ def walk(*, verbose: bool = True) -> dict:
             bad.append(f"{key}: 期望 {val} 实得 {got}")
     check("设置控件逐个生效（15 项，走真实信号）", not bad, "；".join(bad) or "全部生效")
 
-    # 语义断言（不只是"存进去了"）：透明度真的进了样式、浅色真的换了底、密度真的改了间距
+    # 语义断言（不只是「存进去了」）：透明度真的进了样式、浅色真的换了底、密度真的改了间距
     applied = ui["applied"]
     check("透明度生效（panel_alpha=88 → 样式)", applied.get("panel_alpha") == 88,
           f"applied={applied.get('panel_alpha')}")
@@ -141,7 +141,7 @@ def walk(*, verbose: bool = True) -> dict:
           f"margin={applied['spacing']['margin']}")
     check("字号生效（12pt）", applied.get("font_pt") == 12.0, f"font_pt={applied.get('font_pt')}")
 
-    # ── C. 背景图：走"选文件 → 文本 → editingFinished"的真路径 ──
+    # ── C. 背景图：走「选文件 → 文本 → editingFinished」的真路径 ──
     _apply_now("light", False)
     for img, label in ((purple, "紫"), (gray, "灰"), (noise, "彩噪")):
         got = _apply_now("wallpaper", str(img))
@@ -170,14 +170,14 @@ def walk(*, verbose: bool = True) -> dict:
           a_gray.get("note", "")[:60])
     check("锁定后原样使用、不计算", a_lock["source"] == "locked" and a_lock["accent"] == "#123456",
           a_lock["accent"])
-    # 解锁 → **应当按当前底图自动取色**（这是"自动"的语义）
+    # 解锁 → **应当按当前底图自动取色**（这是「自动」的语义）
     _apply_now("accent_locked", False)
     auto_after_unlock = ui["applied"].get("accent")
     check("解锁后按底图自动取色（彩噪图 → 不是原锁定色）",
           auto_after_unlock != "#123456", f"{auto_after_unlock}")
     # 用户**显式选**强调色 → 必须原样保留（走真实路径：下拉框 → 信号 → _apply → 存盘 + 通知）。
     # 注意要选**四档预设里真实存在的颜色**（走查第一版选了自动取色得到的 #8310A0，
-    # 下拉框里没有它 → 回退 index 0 且无信号 → 误判成"被覆盖"，纯属测试自己写错）。
+    # 下拉框里没有它 → 回退 index 0 且无信号 → 误判成「被覆盖」，纯属测试自己写错）。
     target = "#2FC6C6"
     _apply_now("accent", target)
     app.processEvents()
