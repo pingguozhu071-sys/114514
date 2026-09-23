@@ -491,6 +491,34 @@ def t_gbk_console():
     return ok(f"GBK 严格模式下退出码 {code}（不再抛 UnicodeEncodeError）")
 
 
+@case("F4 --json 恒 UTF-8：GBK 控制台下管道那头必须能直接 json.load")
+def t_json_utf8_on_gbk_console():
+    """第二起真实事故（打包态冒烟抓到）：`daedalus-cli.exe --json doctor > x.json` 在 GBK
+    代码页下按 GBK 写出，管道那头 `json.load` 抛 `UnicodeDecodeError`。
+    `--json` 是**机器读的契约**，编码必须与码页无关；人类可读输出则继续跟随控制台码页。"""
+    import io
+    from daedalus import cli
+    def body(app):
+        buf = io.TextIOWrapper(io.BytesIO(), encoding="gbk", errors="strict", newline="")
+        real = sys.stdout
+        sys.stdout = buf
+        try:
+            code = cli.main(["--json", "doctor"])
+            buf.flush()
+            raw = buf.buffer.getvalue()             # type: ignore[attr-defined]
+        finally:
+            sys.stdout = real
+        assert code == 0, code
+        try:
+            payload = json.loads(raw.decode("utf-8"))     # ← 事故现场就在这一行
+        except UnicodeDecodeError as e:
+            raise AssertionError(f"--json 不是 UTF-8（GBK 控制台下写出）：{e}；前 40 字节={raw[:40]!r}")
+        assert any(b > 0x7F for b in raw), "输出里没有非 ASCII 字符，这条用例等于没测"
+        assert isinstance(payload, dict) and payload, payload
+        return ok(f"GBK 控制台下 stdout 仍为 UTF-8（{len(raw)} 字节，含 {sum(b > 0x7F for b in raw)} 个非 ASCII 字节）")
+    return with_app(body, name="f4")
+
+
 # ══════════════════════════════════════════════════════════════════
 def main() -> int:
     fails = skips = 0

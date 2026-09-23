@@ -48,7 +48,7 @@ _JSON_STATE = {"json": False}
 _INJECT: dict = {"factory": None}
 
 
-def _make_output_safe() -> None:
+def _make_output_safe(json_mode: bool = False) -> None:
     """让控制台输出**永不因编码崩**（Windows 打包态的 GBK 控制台是真实存在的场景）。
 
     真实事故（S10b 打包冒烟抓到的）：`doctor` 的人类可读输出里有 `⚠`/`✗`，在 GBK 代码页的
@@ -56,10 +56,16 @@ def _make_output_safe() -> None:
     所以之前 13 个 CLI 用例全绿也没发现。两层修法：
       1) 这里把 stdout/stderr 的 `errors` 设成 `replace`（编不出的字符退化成 `?`，不崩）；
       2) 人类可读输出尽量用 ASCII 标记（`[!]`/`[x]`），符号类只出现在 GUI 与日志文件里。
+    第 3 条：`--json` 是**机器读的契约**，编码恒为 UTF-8——跟控制台码页无关。第二起真实事故：
+    打包态 `--json doctor` 在 GBK 控制台按 GBK 写出，管道那头 `json.load` 直接 `UnicodeDecodeError`。
     """
     for stream in (sys.stdout, sys.stderr):
         try:
-            if stream is not None and hasattr(stream, "reconfigure"):
+            if stream is None or not hasattr(stream, "reconfigure"):
+                continue
+            if json_mode and stream is sys.stdout:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            else:
                 stream.reconfigure(errors="replace")
         except Exception:
             pass
@@ -381,9 +387,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    _make_output_safe()                          # 控制台编码安全（打包态 GBK 场景）
+    _make_output_safe()                          # 控制台编码安全（打包态 GBK 场景；先兜住 argparse 的报错路径）
     args = build_parser().parse_args(argv)
     _JSON_STATE["json"] = bool(args.json)
+    _make_output_safe(_JSON_STATE["json"])       # --json：stdout 固定 UTF-8（机器读的契约，与码页无关）
     try:
         return int(args.fn(args))
     except SystemExit as e:                      # 配置/用法问题：退出码 2
