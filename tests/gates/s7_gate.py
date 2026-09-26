@@ -9,6 +9,7 @@
                B5 中文目录路径不炸
   C 阈值告警   C1 队列/失败率/磁盘/内存/延迟五类都能报警｜C2 指标缺失报 unknown（不是 ok）
   D 资源计划   D1 Σ(池规模×单任务峰值) ≤ 4GB 且算式可读｜D2 无界队列被拒｜D3 写线程 ≠1 被拒
+               D4 HLS 分片并发在自证与注册表里（同一个数、两处可见）
   E 下钻       E1 单任务视图（任务+证据+原始层+派生层）｜E2 台账五态｜E3 JSONL 导出
                E4 不存在的任务如实说｜E5 缺失表如实说
   F 生命周期   F1 在飞强引用（对象被持有、能取消）｜F2 取消 = 交还队列（**不计失败**）
@@ -264,6 +265,37 @@ def t_plan_violations():
         bad.append(str(e))
     assert len(bad) == 3, bad
     return ok("；".join(b[:34] for b in bad))
+
+
+@case("D4 资源计划覆盖 HLS 分片并发：算式里有、注册表里有、超了会拒")
+def t_plan_hls_subject():
+    """自有审计的原话：`ResourcePlan.memory_terms()` 里**没有 HLS 科目**——
+    HLS 自建线程池、自成并发，却不在「内存自证」里；漏一项 = 自证不成立。"""
+    from daedalus.core.limits import MEMORY_BUDGET_MB, PlanViolation, ResourcePlan
+    from daedalus.core.registry import DEFAULT_CAPACITIES, ResourceRegistry
+    plan = ResourcePlan.from_config(None)
+    terms = {t[0]: t for t in plan.memory_terms()}
+    assert "hls" in terms, list(terms)
+    _name, size, peak, subtotal = terms["hls"]
+    assert int(size) == int(plan.hls_segments) and float(subtotal) == int(size) * float(peak), \
+        terms["hls"]
+    txt = plan.memory_arithmetic()
+    assert "hls" in txt and plan.memory_total_mb() <= MEMORY_BUDGET_MB, txt
+    # 「登记值」只能有一个出处：计划的 hls_segments 与注册表默认容量必须一致
+    assert int(DEFAULT_CAPACITIES["hls_segments"]) == int(plan.hls_segments), DEFAULT_CAPACITIES
+    assert ResourceRegistry().capacity("hls_segments") == plan.hls_segments
+    # 容量调到 0 → 缺省即拒绝（取槽立刻失败，不排队）
+    reg = ResourceRegistry()
+    reg.register("hls_segments", 0)
+    got, why = reg.gate("hls_segments").acquire(0.05)
+    assert got is False and why == "capacity_zero", (got, why)
+    try:
+        ResourcePlan(hls_segments=200, peak_hls_mb=64.0).validate()
+        raise AssertionError("HLS 池把内存预算撑爆了居然通过")
+    except PlanViolation as e:
+        assert "内存预算" in str(e), str(e)
+    return ok(f"{txt}；注册表 hls_segments={plan.hls_segments}（与计划同源）；"
+              f"容量 0 → capacity_zero；超预算被拒")
 
 
 @case("E1/E2/E3/E4/E5 下钻：单任务视图 + 五态台账 + JSONL 导出 + 缺数据如实说")

@@ -46,6 +46,9 @@ class RunSummary:
         self.seconds_list: list[float] = []
         self.stopped_early = False
         self.notes: list[str] = []
+        # 本次运行**实际**批准的 worker 容量（经计划对照 + 注册表裁决后的值）。
+        # 它不是「调用方要的数」——要的就是这个区别：容量是被裁过的，且要看得见。
+        self.workers = 0
 
     def add(self, state: str, seconds: float, report: dict) -> None:
         self.tasks += 1
@@ -60,7 +63,7 @@ class RunSummary:
                 "per_task_p50": round(self._pct(0.50), 4),
                 "per_task_p95": round(self._pct(0.95), 4),
                 "stopped_early": self.stopped_early, "notes": self.notes[-20:],
-                "reports_n": len(self.reports)}
+                "workers": int(self.workers), "reports_n": len(self.reports)}
 
     def _pct(self, q: float) -> float:
         xs = sorted(self.seconds_list)
@@ -122,13 +125,18 @@ class EngineApp:
         self.ledger = ChangeLedger(root / "ledger.jsonl")
         self.drilldown = Drilldown(self.db, ledger=self.ledger)
         self.fetcher = build_fetcher(self.cfg)
+        # 资源账本要在**建执行面之前**就位：媒体环境（HLS 分片并发）与子进程执行面
+        # （ffmpeg 槽位）都要从它取额度。「登记了但没人读」正是自有审计抓到的形态
+        # （`subprocess_slots` / 自建 HLS 线程池），所以把它变成装配顺序上的必答题：
+        # 环境先拿到同一个 `registry_res`，容量才有唯一的出处。
+        self.registry_res = ResourceRegistry(self._capacities())
 
         self.net_env = NetEnvironment(self.fetcher, cache=None, cookies=None)
-        self.media_env = MediaEnvironment(self.fetcher, workdir=root / "media")
+        self.media_env = MediaEnvironment(self.fetcher, workdir=root / "media",
+                                          registry=self.registry_res)
         self.browser_env = None
         self.router = Router(enabled_environments=(Environment.NETWORK, Environment.ARTIFACT),
                              max_transitions=self.plan.memory_budget_mb and 8)
-        self.registry_res = ResourceRegistry(self._capacities())
         self.inflight = InflightRegistry()
         # 发现链默认只追站内（同域）链接；站外只记不追（避免顺手把整个互联网拉进来）
         self.discovery = Discovery(same_site_only=True, fetcher=self.fetcher)
@@ -156,6 +164,11 @@ class EngineApp:
             app.fetcher = fetcher
             app.net_env.fetcher = fetcher
             app.media_env.fetcher = fetcher
+            # 发现链也要一起换：它拿 `is_allowed` 做策略过滤，漏掉它就会出现
+            # 「门禁说是离线，但发现新链接时仍然去问真咽喉（可能拉 robots.txt）」——
+            # 假栈必须**到处都是假的**，否则「离线跑」这句话不成立。
+            if getattr(app, "discovery", None) is not None:
+                app.discovery.fetcher = fetcher
         if enable_browser:
             app.enable_browser(browser_contexts, browser_pages)
         app.browser_settle = 0.5
@@ -167,10 +180,16 @@ class EngineApp:
         return app
 
     def _capacities(self) -> dict:
-        """资源账本：把资源计划里的池规模变成注册表容量（**缺省即拒绝**的判据来源）。"""
+        """资源账本：把资源计划里的池规模变成注册表容量（**缺省即拒绝**的判据来源）。
+
+        ⚠️ 这里**一一对应**，没有「计划里写了但注册表没有」的科目——否则那条计划就是装饰。
+        `hls_segments` 是「环境内部的并发科目」（任务不声明它，但会撞上它），
+        它不经 `require()` 而经 `registry.gate()` 生效（见 `adapters/hls.py`）。
+        """
         return {"network": self.plan.download_threads, "thread": self.plan.parse_threads,
                 "process": self.plan.reparse_processes,
                 "subprocess": self.plan.subprocess_slots,
+                "hls_segments": self.plan.hls_segments,
                 "browser": self.plan.browser_contexts, "async": 0}
 
     def enable_browser(self, contexts: int | None = None, pages: int | None = None) -> dict:
@@ -199,26 +218,60 @@ class EngineApp:
         return {"started": True, "disk_path": str(self.data_root)}
 
     # ── 采集 ────────────────────────────────────────────────────
+    def worker_capacity(self, workers: int) -> int:
+        """把调用方要的 worker 数**对照资源计划**核一遍，返回可用容量。
+
+        三条不许（自有审计：「执行资源面写好了没通电」）：
+          * workers 是**下载线程**的一部分，过去裸起 `threading.Thread` × workers，
+            与 `ResourcePlan.download_threads` 没有任何强制关系——现在超过计划值就**报错**
+            （`PlanViolation`），不静默截断、也不默默超发；
+          * 容量必须**经注册表取**（`registry.require`）：未登记 / 容量 0 → `ResourceDenied`
+            （缺省即拒绝）——注册表与计划不一致时，以注册表为准；
+          * 零/负 worker 是非法调用，不做「自动兜底成 1」这种静默修正。
+        """
+        from daedalus.core.limits import PlanViolation
+        from daedalus.core.task import ResourceRequest
+        want = int(workers)
+        planned = int(self.plan.download_threads)
+        if want <= 0:
+            raise PlanViolation(
+                f"workers={want} 非法：worker 数必须为正（不做静默兜底成 1 这种修正）")
+        if want > planned:
+            raise PlanViolation(
+                f"workers={want} 超过资源计划 plan.download_threads={planned}："
+                f"worker 就是下载线程，超发会让「Σ(池规模×单任务峰值) ≤ 内存预算」这条自证失效。"
+                f"要更多并发请提高 [limits].download_threads，或把 workers 调小（不许静默截断）")
+        self.registry_res.require(ResourceRequest(network=want))      # 注册表裁决
+        return min(want, int(self.registry_res.capacity("network")))
+
     def run_targets(self, urls, *, workers: int = 4, budget: Budget | None = None,
                     goal: str = "", idle_timeout: float = 300.0,
                     deadline: float | None = None,
                     stop_event: "threading.Event | None" = None) -> RunSummary:
         """把一批 URL 变成任务跑完（多线程领取直到前沿空）。
 
-        `workers` 是**领取线程数**；每个任务内部的资源开销由资源计划与预算管着。
+        `workers` 是**领取线程数**（= 下载线程），**必须 ≤ `plan.download_threads`**，
+        并且要过注册表的容量裁决（`worker_capacity()`）——超了就是 `PlanViolation`，
+        不静默截断。承载它的池是 `exec/pools.py` 的 `ManagedPool`（有界提交 + 优雅关闭），
+        **不是**裸 `threading.Thread` 数组（自有审计的原话：那样写等于「资源计划没通电」）。
+        每个任务内部的资源开销由资源计划与预算管着。
         `stop_event` 是**可选中止**：界面上的「停止」把它 set 上，worker 在下一轮领取前退出
         （`summary.stopped_early=True`）。**已领走的租约不丢**——要么跑完、要么按租约超时
         回到队列，下次继续；中止不等于丢任务。
 
         ⚠️ 收工条件（S9 门禁跑出来的真 bug）：**队列空 + 没有在飞任务** 才退出。
-        曾经写成"空手就等到 idle_timeout（默认 300s）"——于是 `daedalus collect URL`
-        跑完最后一个任务还要**空转五分钟**才返回（用户看到的是"命令卡住"）。
-        为什么不能"队列空就立刻退"：别的 worker 手上那个任务可能**发现子任务**再入队，
-        提前退出会把它们漏掉。所以判据是"队列空 **且** in_flight == 0"（租约里的活都干完了）。
+        曾经写成「空手就等到 idle_timeout（默认 300s）」——于是 `daedalus collect URL`
+        跑完最后一个任务还要**空转五分钟**才返回（用户看到的是「命令卡住」）。
+        为什么不能「队列空就立刻退」：别的 worker 手上那个任务可能**发现子任务**再入队，
+        提前退出会把它们漏掉。所以判据是「队列空 **且** in_flight == 0」（租约里的活都干完了）。
         """
         from daedalus.core.task import ResourceRequest, Task
+        from daedalus.exec.pools import ManagedPool
         summary = RunSummary()
         b = budget or Budget.small()
+        # 容量先核（在任何入队/起线程之前）：核不过就**什么都不做**地报错
+        workers = self.worker_capacity(workers)
+        summary.workers = workers
         t0 = time.monotonic()
         summary.seconds = 0.0
         for u in urls or []:
@@ -230,7 +283,6 @@ class EngineApp:
             okk, why = self.frontier.enqueue(task)
             if not okk:
                 summary.notes.append(f"入队失败 {u}：{why}")
-        workers = max(1, int(workers))
         lock = threading.Lock()
         stop_at = (time.monotonic() + float(deadline)) if deadline else None
 
@@ -243,7 +295,7 @@ class EngineApp:
                         summary.stopped_early = True
                     return
                 # 界面的「停止」：下一轮领取前退出。**已经领走的租约不丢**——
-                # 要么跑完，要么按租约超时回到队列，下次接着做（中止不是"丢任务"）。
+                # 要么跑完，要么按租约超时回到队列，下次接着做（中止不是「丢任务」）。
                 if stop_event is not None and stop_event.is_set():
                     with lock:
                         summary.stopped_early = True
@@ -271,12 +323,26 @@ class EngineApp:
                     with lock:
                         summary.add(str(rep.final_state), time.monotonic() - t1, rep.to_dict())
 
-        threads = [threading.Thread(target=worker, args=(f"{self.worker_id}-{i}",),
-                                    name=f"dae-worker-{i}") for i in range(workers)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+        # 池名固定为 targets：观测面（门禁/指标）靠它读「worker 容量真的生效了」
+        pool = ManagedPool("targets", workers, registry=self.registry_res,
+                          capacity_name="network", queue_max=max(8, workers * 2)).start()
+        futs = []
+        for i in range(workers):
+            fut, why = pool.submit(worker, f"{self.worker_id}-{i}",
+                                   task_id=f"{self.worker_id}-{i}")
+            if fut is None:
+                summary.notes.append(f"worker {i} 提交失败：{why}")
+            else:
+                futs.append(fut)
+        if not futs:
+            pool.shutdown(drain=False)
+            raise RuntimeError("一个 worker 都没提交成功：拒绝「零线程静默返回」这种假成功")
+        pool.shutdown(drain=True)          # 等所有 worker 自然收工（= 原来的 join）
+        for f in futs:                     # 池化后 worker 的异常不会再被吞进 stderr
+            try:
+                f.result()
+            except Exception as e:
+                summary.notes.append(f"worker 异常：{type(e).__name__}: {e}")
         summary.seconds = time.monotonic() - t0
         METRICS.set("app.last_run_seconds", summary.seconds)
         return summary
@@ -429,6 +495,9 @@ class EngineApp:
             "secrets": {"dpapi": dpapi_available()},
             "net": {"dns_cache": cache_stats()},
             "metrics": METRICS.summary(),
+            # 解析器名单（**冻结态自证的一部分**：打包态注册表掉成员时 doctor 当场可见，
+            # tools/build.py 的打包态冒烟就靠它断言四件套齐——台账 B20-2）
+            "parsers": [p.get("name") for p in self.registry.summary()],
             "ui": ui_info,                 # 界面语言与来源（装完在目标机上可查）
             "problems": problems,
             "warnings": warnings,

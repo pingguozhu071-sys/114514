@@ -76,7 +76,7 @@ class DeterministicFetcher:
             self.bytes += len(body)
         return FakeResp(200, {"Content-Type": ctype, "Content-Length": str(len(body))}, body)
 
-    def is_allowed(self, url):
+    def is_allowed(self, url, *, fetch=True):
         return True, "ok"
 
     def stats(self):

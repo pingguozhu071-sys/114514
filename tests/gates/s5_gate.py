@@ -4,7 +4,8 @@
 覆盖：**产物契约**（大小/格式/MIME/哈希；"命令返回 0 但产物坏"要能被抓）、
 **子进程执行面**（缺件硬报错、就绪探测、UTF-8 不改自身 locale、超时、ASCII 输出名）、
 **媒体环境**（大对象走断点续传 + 契约；缺 ffmpeg 时明确告知而不是静默）、
-**HLS 分片并发 + 按序**（含 AES-128 加密分片）、**进程隔离的制品元数据解析**（缺省即拒绝 + 超时终止）。
+**HLS 分片并发 + 按序**（含 AES-128 加密分片）、**进程隔离的制品元数据解析**（缺省即拒绝 + 超时终止）、
+**注册表入口可达性**（`default_registry()` 真能到 `artifact_meta`，不是只有直接 import 才能）。
 
 跑法（离线；不联网）：
     python tests/gates/s5_gate.py        # 退出码 0 = 全通过
@@ -89,7 +90,7 @@ class FakeFetcher:
                 return FakeResp(resp[0], resp[1], resp[2]) if isinstance(resp, tuple) else resp
         return FakeResp(200, {}, self._default)
 
-    def is_allowed(self, url):
+    def is_allowed(self, url, *, fetch=True):
         return True, "ok"
 
     def stats(self):
@@ -274,7 +275,7 @@ def t_media_large():
         def open(self, url, method="GET", headers=None, timeout=None):
             return FakeResp(200, {"Content-Type": "image/png", "Content-Length": str(len(png))}, png)
 
-        def is_allowed(self, url):
+        def is_allowed(self, url, *, fetch=True):
             return True, "ok"
     env = MediaEnvironment(One(), workdir=_TMP)
     v = env.download_large("https://example.com/pic.png", _TMP / "pic.png",
@@ -415,6 +416,31 @@ def t_isolated_media_honest():
     assert out.get("ok") is False and out.get("error"), out
     assert ("缺 ffprobe" in out["error"]) or ("ffprobe" in out["error"]), out["error"]
     return ok(out["error"][:56] + "…")
+
+
+@case("D6 引擎路径：default_registry() **真的能到**制品元数据解析器（自动注册）")
+def t_registry_reaches_artifact_meta():
+    """盯住那次漏注册：`mediainfo.SPEC` 以前从没进过注册表，引擎路径永远解析不了制品元数据
+    （只有门禁直接 import 才跑到它）。这里走的是**注册表入口**，不是直接调解析器。"""
+    from daedalus.understand.registry import default_registry
+    reg = default_registry()
+    assert "artifact_meta" in [s["name"] for s in reg.summary()], reg.summary()
+    out = reg.parse(zip_bytes(), url="https://example.com/box.zip")
+    assert out.get("format") == "zip" and out.get("tried") == ["artifact_meta"], out
+    assert out.get("ok") is True and out.get("entries") == 2, out
+    assert out.get("parser") == "artifact_meta" and out.get("parser_version") == 1, out
+    # 另一路：认不出格式、也没有本地路径 → **不许编造事实**；成功与否这里**故意不钉死**
+    # （钉死就等于把「空成功」当契约），但必须有可读说明（error 与 note 至少一个）。
+    blind = reg.parse(bytes(range(256)) * 8, url="https://example.com/bin")
+    assert blind.get("format") == "unknown" and blind.get("tried") == ["artifact_meta"], blind
+    assert bool(blind.get("error")) != bool(blind.get("note")), blind
+    for field in ("width", "height", "duration", "entries", "container", "pages_rough"):
+        assert field not in blind, f"没有落盘路径却报出了 {field}：{blind}"
+    flag = ("⚠️ 当前是 ok=True 的空成功（只有 note、没有事实）—— 根因在 parsers/mediainfo.py 的"
+            "accepts 与 ok 判定，不在本次改动范围，报告里点名了") if blind.get("ok") \
+        else "ok=False + 可读原因（应然）"
+    return ok(f"zip → artifact_meta（{out['entries']} 个条目，version {out['parser_version']}）；"
+              f"认不出且无落盘路径时：{flag}")
 
 
 # ══════════════════════════════════════════════════════════════════

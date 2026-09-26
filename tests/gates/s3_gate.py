@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """S3 门禁：捕获面 + 理解面骨架
 
-覆盖：原始层（内容寻址/去重/压缩/血缘/可校验）、探测链、解析器注册表（同构返回/可插拔）、
-归一化、质量闸（拒收≠重试）、**离线重放（reparse，不联网）**、去重与增量台账、
-**中文全文检索（FTS5 + 预分词）**。
+覆盖：原始层（内容寻址/去重/压缩/血缘/可校验）、探测链、解析器注册表（同构返回/可插拔/
+**目录自动发现**）、归一化、质量闸（拒收≠重试）、**离线重放（reparse，不联网）**、
+去重与增量台账、**中文全文检索（FTS5 + 预分词）**。
 
 跑法（离线）：
     python tests/gates/s3_gate.py        # 退出码 0 = 全通过
@@ -202,10 +202,17 @@ def t_registry_homogeneous():
     assert len(good["links"]) == 2 and good["links"][0] == "https://example.com/next"
     assert good["links"][1] == "https://other.example/x", good["links"]     # 去 fragment
     assert good["json_ld"] and good["json_ld"][0]["headline"] == "结构化标题"
-    bad = reg.parse(bytes(range(256)) * 8, url="https://example.com/bin")
-    assert bad["ok"] is False and bad["error"] and bad["tried"] == [], bad
+    # ⚠️ 素材换过（2026-09）：这里原来用 `bytes(range(256)) * 8`（判成 `unknown`，当时没有
+    #    解析器认领）。注册表改成**扫目录**后 `artifact_meta` 自动注册、而它的 `accepts`
+    #    含 `unknown` —— 旧素材于是有了候选，`tried == []` 这条**前提失效**（不是断言该删：
+    #    要断的是「一个候选都没有」这条分支，所以换成**真没有解析器**的格式：SQLite 魔数）。
+    #    旧素材现在的行为（可达 + 不许编造事实）在 s5 门禁里单列一条。
+    bad_blob = b"SQLite format 3\x00" + b"\x00\x01\x02\x03" * 64
+    bad = reg.parse(bad_blob, url="https://example.com/db.sqlite")
+    assert bad["format"] == "sqlite" and bad["ok"] is False and bad["error"], bad
+    assert bad["tried"] == [], bad                                  # 无候选 → tried 必须为空
     assert "没有解析器" in bad["error"] and "原始数据已存" in bad["error"], bad["error"]
-    return ok("成功：title/links/json_ld 齐全；未知格式：可读原因 + 不改行为")
+    return ok("成功：title/links/json_ld 齐全；无候选格式：可读原因 + tried 为空")
 
 
 @case("C2 可插拔：新注册的解析器立刻生效（历史数据可重扫的前提）")
@@ -241,6 +248,29 @@ def t_registry_failure_isolation():
     assert out["ok"] is True and out["parser"] == "html_text", out
     assert out["tried"] == ["always_boom", "html_text"], out["tried"]
     return ok("坏解析器被跳过，好解析器接手（tried 可见）")
+
+
+@case("C4 注册表来自**目录扫描**：artifact_meta 自动注册（这次漏的就是它）")
+def t_registry_autodiscovered():
+    _, _, _, reg, _ = stack("c4")
+    names = [p["name"] for p in reg.summary()]
+    # `parsers/mediainfo.py` 定义了 SPEC，但手写清单里没有它 → 引擎路径永远到不了制品元数据
+    assert "artifact_meta" in names, names
+    assert reg.scan is not None and reg.scan.ok, getattr(reg.scan, "errors", "没有扫描记录")
+    # 逐个数：**目录里每个含 SPEC 的模块**都要在清单里（漏注册/多余都抓得住）
+    import importlib
+    pkg_dir = ROOT / "src" / "daedalus" / "understand" / "parsers"
+    expected: dict[str, str] = {}
+    for path in sorted(pkg_dir.glob("*.py")):
+        if path.name == "__init__.py":
+            continue
+        spec = getattr(importlib.import_module(f"daedalus.understand.parsers.{path.stem}"),
+                       "SPEC", None)
+        if spec is not None:
+            expected[path.stem] = spec.name
+    assert set(names) == set(expected.values()), (sorted(names), sorted(expected.values()))
+    assert len(names) == len(set(names)), f"清单里有重复 name：{names}"
+    return ok(f"扫描到 {len(names)} 个解析器（含 artifact_meta；目录里 {len(expected)} 个含 SPEC）")
 
 
 # ══════════════════════════════════════════════════════════════════

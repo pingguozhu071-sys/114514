@@ -28,10 +28,15 @@ __all__ = ["MediaEnvironment"]
 class MediaEnvironment:
     """制品与媒体环境（大文件 + 流媒体 + 文档制品）。"""
 
-    def __init__(self, fetcher, *, workdir=None, concurrency: int = 4, tools=None):
+    def __init__(self, fetcher, *, workdir=None, concurrency: int = 4, tools=None,
+                 registry=None):
         self.fetcher = fetcher
         self.workdir = pathlib.Path(workdir) if workdir else None
         self.concurrency = int(concurrency)
+        # 资源注册表：**分片并发额度从它读**（`hls_segments` 科目），子进程执行面也用它
+        # （`subprocess` 科目）。不传 = 退化为「请求值 + 绝对上限」并在原因里如实说明——
+        # 产品路径由 `EngineApp` 传入，所以「产物环境有自己的执行槽位」这句话是真的。
+        self.registry = registry
         self._tools = readiness(tools or ("ffmpeg", "ffprobe"))
         self._calls = 0
 
@@ -88,18 +93,20 @@ class MediaEnvironment:
                                      timeout=timeout, workdir=self.workdir,
                                      ffmpeg=which("ffmpeg"), ffprobe=which("ffprobe"),
                                      keep_segments=keep_segments,
-                                     concurrency=self.concurrency, runner=self._runner)
+                                     concurrency=self.concurrency, registry=self.registry,
+                                     runner=self._runner)
         self._calls += 1
         if not okk:
             return Verdict(False, f"HLS 失败：{why}", {"playlist": playlist_url})
         return check_artifact(path, contract or for_media("hls"))
 
-    @staticmethod
-    def _runner(cmd, timeout: float = 1800.0, workdir: str | None = None):
-        """把命令交给统一子进程执行面（`run_tool` 需要"工具名 + 参数"）。
-        这里命令的第一个元素是显式路径，所以直接传 tool 并让 run_tool 走 FileNotFoundError→ToolMissing。"""
+    def _runner(self, cmd, timeout: float = 1800.0, workdir: str | None = None):
+        """把命令交给统一子进程执行面（`run_tool` 需要「工具名 + 参数」）。
+        这里命令的第一个元素是显式路径，所以直接传 tool 并让 run_tool 走 FileNotFoundError→ToolMissing。
+        注册表一并传下去：子进程槽位用的是**同一个** `subprocess` 科目额度。"""
         tool, *args = [str(c) for c in cmd]
-        return run_tool(tool, args, timeout=timeout, workdir=workdir, check_exists=False)
+        return run_tool(tool, args, timeout=timeout, workdir=workdir, check_exists=False,
+                        registry=self.registry)
 
     # ── 文档制品（探测 + 契约）────────────────────────────────────
     def fetch_document(self, url: str, dest, *, contract: ArtifactContract | None = None) -> Verdict:
@@ -107,9 +114,12 @@ class MediaEnvironment:
         return self.download_large(url, dest, contract=contract or for_document("document"))
 
     def stats(self) -> dict:
+        gate = self.registry.gate("hls_segments") if self.registry is not None else None
         return {"calls": self._calls, "capability": self.capability(),
                 "workdir": str(self.workdir) if self.workdir else None,
-                "concurrency": self.concurrency}
+                "concurrency": self.concurrency,
+                # 「实际并发受登记值约束」要能读出来（峰值是**实测**占用）
+                "hls_segments": gate.stats() if gate is not None else None}
 
 
 def _unused_blocked_guard() -> tuple:

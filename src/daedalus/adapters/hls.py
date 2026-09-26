@@ -8,7 +8,10 @@ Daedalus 内的改动：
      并对 `subprocess` 显式 `encoding="utf-8", errors="replace"`（原坑：中文输出解码崩溃）；
   3) 新增**防御上限**：playlist 体积上限（原实现无上限读进内存）、分片数上限（防"恶意清单列百万段"的磁盘炸弹）；
   4) 新增**产物可播验证**：ffprobe 存在时确认能读出时长/流（"命令返回 0 但产物是坏的"要有出口）；
-  5) 分片**并发下载**仍未做（串行），解密与拼接必须按序 —— 留给 S5，登记在 PENDING。
+  5) 分片并发下载 + **并发额度来自注册表**（`hls_segments` 科目）：本文件不再自建
+     「看不出上限的线程池」——实际并发 = min(请求值, 登记容量, 绝对上限, 分片数)，
+     且每个分片在下载期间持有一个**进程级**槽位（多个 HLS 下载共享同一份额度）。
+     登记容量为 0 / 未登记 → **缺省即拒绝**（在下载任何分片之前就明确失败）。
 
 ────────────────────────────────────────────────────────────────
 覆盖的流程
@@ -45,13 +48,20 @@ from pathlib import Path
 
 from daedalus.net.ssrf_gate import BlockedError, safe_open
 
-__all__ = ["parse_playlist", "decrypt_segment", "download_hls", "PlaylistInfo"]
+__all__ = ["parse_playlist", "decrypt_segment", "download_hls", "PlaylistInfo",
+           "segment_concurrency", "DEFAULT_SEGMENT_CONCURRENCY", "MAX_SEGMENT_CONCURRENCY"]
 
 _ATTR_RE = re.compile(r'([A-Z0-9\-]+)=("[^"]*"|[^,]*)')
 
 # 防御上限（原实现没有，属"恶意清单"面）
 MAX_PLAYLIST_BYTES = 4 << 20      # 4MB：异常大的清单本身就是攻击向量
 MAX_SEGMENTS = 5000               # 段数上限：防磁盘炸弹
+# 分片并发：请求值（调用方没给时用）与**绝对**防御上限。
+# 绝对上限只是「误用挡板」，真正的额度来自注册表 `hls_segments`（见 segment_concurrency）。
+# 上限 16 沿用旧实现的写死值——那时它藏在 `min(concurrency, …, 16)` 里，现在它是**兜底**，
+# 正常路径（产品路径）由注册表说话。
+DEFAULT_SEGMENT_CONCURRENCY = 4
+MAX_SEGMENT_CONCURRENCY = 16
 
 
 def _aes_cbc_decrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
@@ -162,15 +172,44 @@ def _ffprobe_ok(ffprobe: str | None, path: Path) -> tuple[bool, str]:
         return False, f"ffprobe 异常: {type(e).__name__}: {e}"
 
 
+def segment_concurrency(requested: int, *, registry=None, n_segments: int) -> tuple[int, str]:
+    """算出**实际**分片并发；第二个返回值非空 = 拒绝原因（此时第一个返回 0）。
+
+    额度优先级（**登记容量是硬上限**，本文件不再自己拍数字）：
+      1) 给了 `registry` 就以它为准（`hls_segments` 科目）：容量 0 / 未登记
+         → `(0, 原因)` —— **缺省即拒绝**，在下载任何分片之前就停住；
+      2) 实际 = `min(请求值, 登记容量, 绝对上限 MAX_SEGMENT_CONCURRENCY, 分片数)`；
+      3) 没给 `registry`（老调用路径 / 单测）→ 退化为 `min(请求值, 绝对上限)`。
+         产品路径永远接注册表：`env/media.py` 从 `EngineApp` 拿到 `registry_res` 传进来。
+    """
+    n = max(0, int(n_segments))
+    want = int(requested)
+    if want <= 0:
+        return 0, f"HLS 分片并发请求值非法（{want}）：必须为正，不做静默兜底"
+    if registry is not None:
+        cap = int(registry.capacity("hls_segments"))
+        if cap <= 0:
+            return 0, (f"HLS 分片并发额度为 0（注册表 hls_segments={cap}）"
+                       f"——**缺省即拒绝**：一片都不下（请显式登记该科目容量）")
+        want = min(want, cap)
+    want = min(want, MAX_SEGMENT_CONCURRENCY, n)
+    if want <= 0:
+        return 0, "HLS 分片列表为空，无可下载分片"
+    return want, ""
+
+
 def download_hls(playlist_url: str, out_path, *, opener=safe_open, timeout: float = 30,
                  workdir=None, ffmpeg: str | None = None, ffprobe: str | None = None,
                  keep_segments: bool = False, max_segments: int = MAX_SEGMENTS,
-                 concurrency: int = 4, runner=None) -> tuple[bool, str | None, str]:
+                 concurrency: int = DEFAULT_SEGMENT_CONCURRENCY, registry=None,
+                 runner=None) -> tuple[bool, str | None, str]:
     """下载一个 HLS 流并合成单片。返回 `(ok, path_or_None, reason)`。
 
     `concurrency`：分片**并发**下载（每片独立解密，各写各的文件）；**拼接顺序由分片序号决定**
     （并发不改变顺序——`concat_list` 始终按 index 生成）。解密与写出都在各自的分片文件里，
     所以并发是安全的；真正必须按序的只有最后的拼装。
+    `registry`：资源注册表（**并发额度从这里读**，见 `segment_concurrency`）。不传则退化为
+    「请求值 + 绝对上限」，并在返回值里如实说明（产品路径必须传）。
     `runner`：外部工具的**执行面**（`exec.subprocess.run_tool` 风格）；不传则用内置 subprocess。
     """
     ffmpeg = ffmpeg or shutil.which("ffmpeg")
@@ -216,10 +255,24 @@ def download_hls(playlist_url: str, out_path, *, opener=safe_open, timeout: floa
             return False, None, f"密钥长度异常: {len(key)}"
 
     # ③ 逐片下载（+ 解密）—— 可并发；**每个分片写自己的文件**，拼接顺序由序号决定
+    # 并发额度先算清（**在下载之前**）：容量 0 / 未登记 → 一片都不下，明确失败。
+    n_workers, nope = segment_concurrency(concurrency, registry=registry,
+                                          n_segments=len(info.segments))
+    if n_workers <= 0:
+        return False, None, nope
+    # 每个分片在下载期间持有一个**进程级**槽位：多个 HLS 下载共享同一份登记额度
+    # （只按调用点各自 clamp 的话，两个并发 HLS 会各自用满额度 → 实际并发是登记值的两倍）。
+    gate = registry.gate("hls_segments") if registry is not None else None
     seg_files: list[Path] = [tmp / f"seg_{i:05d}.ts" for i in range(len(info.segments))]
 
     def fetch_one(i: int) -> tuple[int, str]:
         seg_url = info.segments[i]
+        held = False
+        if gate is not None:
+            held, why_gate = gate.acquire(timeout)
+            if not held:
+                return i, (f"分片 {i} 拿不到并发槽位（{why_gate}，登记容量 {gate.capacity} 已被占满）"
+                           f"——明确失败，不静默无限等待")
         try:
             with opener(seg_url, timeout=timeout) as sr:
                 if sr.status != 200:
@@ -233,8 +286,10 @@ def download_hls(playlist_url: str, out_path, *, opener=safe_open, timeout: floa
             return i, f"分片 {i} 被闸拦下: {e}"
         except Exception as e:
             return i, f"分片 {i} 失败: {type(e).__name__}: {e}"
+        finally:
+            if held:
+                gate.release()
 
-    n_workers = max(1, min(int(concurrency), len(info.segments), 16))
     if n_workers == 1:
         results = [fetch_one(i) for i in range(len(info.segments))]
     else:
@@ -287,4 +342,5 @@ def download_hls(playlist_url: str, out_path, *, opener=safe_open, timeout: floa
             list_file.unlink(missing_ok=True)
         except Exception:
             pass
-    return True, str(out_path), f"ok（{out_path.stat().st_size} 字节，{len(seg_files)} 片；{why}）"
+    return True, str(out_path), (f"ok（{out_path.stat().st_size} 字节，{len(seg_files)} 片，"
+                                 f"并发 {n_workers}；{why}）")

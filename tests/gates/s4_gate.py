@@ -4,7 +4,8 @@
 覆盖：URL 规范化（≥12 条，**签名参数不能当跟踪参数丢掉**）、HTTP 缓存与条件请求（304 复用）、
 直连网络的超时/重试退避抖动/响应上限/编码探测/Cookie/代理、多源发现与策略过滤、
 线程池的资源声明（缺省即拒绝）、有界提交（背压）、任务级看门狗（标记作废**不杀线程**）、优雅关闭、
-以及三段流水线（download→parse→store 各段有界）。
+三段流水线（download→parse→store 各段有界）、以及**执行资源面真的通电了**这条（E6/E7/E8：
+子进程槽位限流、HLS 分片并发额度、`run_targets` 的 worker 容量经注册表并对照资源计划）。
 
 跑法（离线；不联网、不起服务）：
     python tests/gates/s4_gate.py        # 退出码 0 = 全通过
@@ -21,6 +22,7 @@ import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "tools"))     # 借 `_harness` 的离线合成负载（与基准/长跑同一份）
 
 _TMP = pathlib.Path(tempfile.mkdtemp(prefix="daedalus_s4_"))
 os.environ["DAEDALUS_DATA_ROOT"] = str(_TMP)
@@ -82,7 +84,7 @@ class FakeFetcher:
             raise item
         return item
 
-    def is_allowed(self, url):
+    def is_allowed(self, url, *, fetch=True):
         return (self._allow, "ok" if self._allow else "robots.txt 不允许（测试桩）")
 
     def stats(self):
@@ -368,7 +370,7 @@ def t_discovery_policy():
     assert any("站外" in v for v in reasons.values()), reasons
 
     class DenyAll:
-        def is_allowed(self, url):
+        def is_allowed(self, url, *, fetch=True):
             return False, "robots.txt 不允许"
     d2 = Discovery(base_hosts=("example.com",), fetcher=DenyAll())
     acc2, rej2 = d2.filter_policy(res)
@@ -495,6 +497,209 @@ def t_pipeline():
     assert all(p <= m for p, m in zip(peaks, depths)), (peaks, depths)
     assert not st["errors"], st["errors"]
     return ok(f"200 条走完三段；段内峰值 {peaks} / 上限 {depths}")
+
+
+# ── E6~E8：执行资源面的「通电」检查（自有审计：写好了没通电）────────────
+# 三条曾经不成立的事，现在每一条都有可读的运行时证据：
+#   * 子进程槽位只被登记、从没限流 → E6
+#   * HLS 自建线程池、并发额度不在计划/注册表里 → E7
+#   * worker 是裸 `threading.Thread` × N，与 `plan.download_threads` 无关 → E8
+@case("E6 子进程有界：容量来自注册表；拿不到槽**明确失败**（不静默等待、更不静默成功）")
+def t_subprocess_slots():
+    from daedalus.core.registry import ResourceRegistry
+    from daedalus.exec.subprocess import SubprocessDenied, run_tool
+    marker = _TMP / "e6_slot_marker.txt"
+    marker.unlink(missing_ok=True)
+    reg = ResourceRegistry({"subprocess": 1})
+    gate = reg.gate("subprocess")
+    held = {}
+
+    def hold_slot():
+        res = run_tool(sys.executable, ["-c", "import time;time.sleep(1.2)"],
+                       timeout=30, registry=reg)
+        held["ok"] = res.ok
+
+    t = threading.Thread(target=hold_slot, name="s4-e6-holder")
+    t.start()
+    time.sleep(0.25)                       # 让 holder 先拿到唯一那个槽
+    assert gate.stats()["acquired"] == 1, gate.stats()
+    # 第二个：同一个容量 1 的额度 → 等到上限就**明确失败**（并把原因说清）
+    res_b = run_tool(sys.executable,
+                     ["-c", "import pathlib,sys;pathlib.Path(sys.argv[1]).write_text('ran')",
+                      str(marker)],
+                     timeout=30, registry=reg, slot_wait=0.3)
+    assert res_b.ok is False, f"第二个调用居然成功了：{res_b.brief()}"
+    assert res_b.slot_denied is True and res_b.returncode == -3, res_b
+    assert "槽位" in res_b.stderr and "容量 1" in res_b.stderr, res_b.stderr
+    t.join(15)
+    assert held.get("ok") is True, held
+    assert not marker.exists(), "拿不到槽却把命令跑了（静默成功）"
+    st = gate.stats()
+    assert st["peak"] == 1 and st["timed_out"] == 1, st
+    # 容量 0 = 缺省即拒绝：**抛异常**（不是排队、不是降级成直接跑）
+    reg0 = ResourceRegistry()
+    reg0.register("subprocess", 0)
+    try:
+        run_tool(sys.executable, ["-c", "print(1)"], registry=reg0)
+        raise AssertionError("容量 0 时居然跑起来了（缺省即拒绝没生效）")
+    except SubprocessDenied as e:
+        assert "缺省即拒绝" in str(e), str(e)
+    return ok(f"容量 1：第二个拿不到槽 → rc=-3 / slot_denied，命令**没被执行**；"
+              f"峰值占用 {st['peak']}；容量 0 → SubprocessDenied")
+
+
+@case("E7 HLS 分片并发受登记值约束（额度来自注册表；容量 0 一片都不下）")
+def t_hls_segment_concurrency():
+    import types
+
+    from daedalus.adapters.hls import download_hls, segment_concurrency
+    from daedalus.core.registry import ResourceRegistry
+
+    n_seg = 40
+    playlist = ("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n"
+                + "".join(f"seg{i}.ts\n" for i in range(n_seg)) + "#EXT-X-ENDLIST\n")
+
+    class Resp(FakeResp):
+        pass
+
+    live = {"now": 0, "peak": 0}
+    lk = threading.Lock()
+
+    def make_opener(counter):
+        def opener(url, **kw):
+            if str(url).endswith(".m3u8"):
+                return Resp(200, {"Content-Type": "application/vnd.apple.mpegurl"},
+                            playlist.encode())
+            with lk:
+                counter["now"] += 1
+                counter["peak"] = max(counter["peak"], counter["now"])
+            try:
+                time.sleep(0.02)           # 让分片真的重叠（否则测到的是"恰好没撞上"）
+                return Resp(200, {}, b"T" * 2048)
+            finally:
+                with lk:
+                    counter["now"] -= 1
+        return opener
+
+    def stub_ffmpeg(cmd, **kw):             # 只验并发，不调外部进程（离线）
+        return types.SimpleNamespace(returncode=1, stderr="stub-ffmpeg")
+
+    # ① 单次调用：请求 8、登记 2 → 实际 2（且**峰值**就是 2）
+    reg = ResourceRegistry({"hls_segments": 2})
+    assert segment_concurrency(8, registry=reg, n_segments=n_seg)[0] == 2
+    d1 = _TMP / "e7_one"
+    r1 = download_hls("https://cdn.example.com/i.m3u8", d1 / "a.ts", opener=make_opener(live),
+                      registry=reg, concurrency=8, ffmpeg="stub-ffmpeg", workdir=d1,
+                      runner=stub_ffmpeg)
+    assert "ffmpeg" in r1[2], r1                 # 走到合成那步（说明分片已下完）
+    assert live["peak"] == 2, f"单次调用峰值 {live['peak']} ≠ 登记容量 2"
+    assert reg.gate("hls_segments").stats()["peak"] == 2, reg.gate("hls_segments").stats()
+
+    # ② 容量 0 = 缺省即拒绝：**在下载任何分片之前**就失败
+    reg0 = ResourceRegistry({"hls_segments": 0})
+    zero = {"now": 0, "peak": 0}
+    d0 = _TMP / "e7_zero"
+    r0 = download_hls("https://cdn.example.com/i.m3u8", d0 / "a.ts", opener=make_opener(zero),
+                      registry=reg0, concurrency=4, ffmpeg="stub-ffmpeg", workdir=d0,
+                      runner=stub_ffmpeg)
+    assert r0[0] is False and "缺省即拒绝" in r0[2], r0
+    assert zero["peak"] == 0, f"容量 0 却下了分片：{zero}"
+
+    # ③ 两次并发下载**共享**同一份额度（全局峰值 ≤ 登记容量）
+    reg2 = ResourceRegistry({"hls_segments": 3})
+    both = {"now": 0, "peak": 0}
+    errs: list = []
+
+    def one_call(i: int) -> None:
+        d = _TMP / f"e7_multi{i}"
+        try:
+            download_hls("https://cdn.example.com/i.m3u8", d / "a.ts", opener=make_opener(both),
+                         registry=reg2, concurrency=3, ffmpeg="stub-ffmpeg", workdir=d,
+                         runner=stub_ffmpeg)
+        except Exception as e:              # 门禁自己也要如实报错
+            errs.append(f"{type(e).__name__}: {e}")
+
+    ts = [threading.Thread(target=one_call, args=(i,), name=f"s4-e7-{i}") for i in range(2)]
+    for x in ts:
+        x.start()
+    for x in ts:
+        x.join(60)
+    assert not errs, errs
+    assert both["peak"] <= 3, f"两次并发下载全局峰值 {both['peak']} > 登记容量 3"
+    assert both["peak"] >= 2, f"没测到并发（峰值 {both['peak']}）——断言会变成假绿"
+    return ok(f"请求 8/登记 2 → 峰值 2；两次并发共享额度 → 全局峰值 {both['peak']} ≤ 3；"
+              f"容量 0 → 未下一片即拒")
+
+
+@case("E8 run_targets 容量经注册表：超计划**报错**；并发 worker 数 ≤ 登记容量")
+def t_run_targets_capacity():
+    from _harness import DeterministicFetcher, payload_for
+    from daedalus.core.app import EngineApp
+    from daedalus.core.limits import PlanViolation
+    from daedalus.core.registry import ResourceDenied
+    from daedalus.core.task import ResourceRequest
+    from daedalus.obs.metrics import METRICS
+    fetcher = DeterministicFetcher(lambda u: payload_for(u, "html", 8192))
+    app = EngineApp.build({"limits": {"download_threads": 3}}, data_root=_TMP / "e8",
+                          fetcher=fetcher, with_sampler=False)
+    try:
+        cap = int(app.registry_res.capacity("network"))
+        assert cap == 3 and int(app.plan.download_threads) == 3, (cap, app.plan.download_threads)
+        # ① 超过计划 → 明确报错（**且什么都没入队**：校验在入队/起线程之前）
+        try:
+            app.run_targets(["https://bench.local/over"], workers=cap + 1)
+            raise AssertionError("workers 超计划居然没报错（静默截断/默默超发）")
+        except PlanViolation as e:
+            assert str(cap) in str(e) and str(cap + 1) in str(e), str(e)
+        assert int(app.frontier.stats().get("claimable", 0)) == 0, "报错前就把任务入队了"
+        # 注册表比计划更严时**以注册表为准**（容量真的经注册表取，而不是只看计划）
+        app.registry_res.register("network", 2)
+        try:
+            app.run_targets([], workers=3)
+            raise AssertionError("注册表容量 2 却放行了 workers=3")
+        except ResourceDenied as e:
+            assert "network" in str(e), str(e)
+        app.registry_res.register("network", 3)
+        # ② 真跑一批：运行期峰值并发 ≤ 登记容量，且 worker 真的跑在受管池的线程上
+        live = {"now": 0, "peak": 0}
+        threads_seen: set[str] = set()
+        lk = threading.Lock()
+        orig = app.runner.run_one
+
+        def probed(task):
+            with lk:
+                threads_seen.add(threading.current_thread().name)
+                live["now"] += 1
+                live["peak"] = max(live["peak"], live["now"])
+            try:
+                time.sleep(0.05)            # 让 worker 真的重叠（测"实际并发"）
+                return orig(task)
+            finally:
+                with lk:
+                    live["now"] -= 1
+
+        app.runner.run_one = probed
+        summary = app.run_targets([f"https://bench.local/p{i}" for i in range(8)], workers=3)
+        assert summary.tasks == 8 and summary.states.get("done") == 8, summary.to_dict()
+        assert summary.workers == 3 and summary.stopped_early is False, summary.to_dict()
+        assert summary.seconds < 30, f"收工太慢（{summary.seconds:.1f}s）：像是又回到了等 idle_timeout"
+        assert 0 < live["peak"] <= cap, (live, cap)
+        assert live["peak"] == 3, f"没测到并发（峰值 {live['peak']}）——那条 ≤ 断言会变成假绿"
+        assert any(n.startswith("dae-targets") for n in threads_seen), threads_seen
+        assert app.registry_res.problems(ResourceRequest(network=3)) == []
+        assert METRICS.counter("exec.pool_started", name="targets") >= 1, "没走 ManagedPool"
+        assert METRICS.gauge("exec.threads", name="targets") == 0, "收工后线程没回落"
+        # ③ 收工/中止语义没变：stop_event 一置位就退出，stopped_early 仍然正确
+        ev = threading.Event()
+        ev.set()
+        s2 = app.run_targets([f"https://bench.local/q{i}" for i in range(4)], workers=2,
+                             stop_event=ev)
+        assert s2.stopped_early is True and s2.tasks == 0, s2.to_dict()
+        return ok(f"超计划 workers={cap + 1} → PlanViolation（未入队）；注册表更严 → "
+                  f"ResourceDenied；跑 8 条峰值并发 {live['peak']} ≤ 容量 {cap}；"
+                  f"池线程 {sorted(threads_seen)[:2]}；中止语义不变")
+    finally:
+        app.shutdown()
 
 
 # ══════════════════════════════════════════════════════════════════

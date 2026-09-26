@@ -42,6 +42,11 @@ class ResourcePlan:
     reparse_processes: int = 12
     writer_threads: int = 1
     subprocess_slots: int = 4
+    # HLS 分片并发（**进程级**额度，多个 HLS 下载共享）。16 不是新拍的数：
+    # 旧实现 `adapters/hls.py` 里就有一个 `min(concurrency, 分段数, 16)` 的**写死**上限，
+    # 这里只是把它从「藏在适配器里的魔法数字」变成「计划表里可校验的一项」。
+    # ⚠️ 与 `core/registry.py` 的 `DEFAULT_CAPACITIES` 必须一致（注册表按本表登记）。
+    hls_segments: int = 16
     browser_contexts: int = 0            # 缺省 0：浏览器环境未启用（缺省即拒绝）
     browser_pages: int = 0
     queue_frontier: int = 200_000
@@ -54,6 +59,11 @@ class ResourcePlan:
     peak_download_mb: float = 8.0
     peak_parse_mb: float = 48.0
     peak_browser_mb: float = 300.0
+    # HLS 分片单片的峰值内存：分片是**整段读进内存**（`resp.read()` 全量）+ 解密
+    # （解密时明文与密文同时在内存里 ≈ 2× 分片大小）。6–10 秒的 TS 分片在 2–8 Mbps 下
+    # 约 1.5–10 MB，取 10 MB 上界 → 2×10 = 20 MB，再加解密库/写盘缓冲的余量取 32 MB。
+    # ⚠️ 这是**保守估计**（估算模型），**不是**实测值：真要收紧必须先量真实分片大小分布。
+    peak_hls_mb: float = 32.0
     memory_budget_mb: float = MEMORY_BUDGET_MB
 
     # ── 算术 ────────────────────────────────────────────────────
@@ -68,6 +78,10 @@ class ResourcePlan:
              int(self.reparse_processes) * float(self.peak_parse_mb)),
             ("subprocess", int(self.subprocess_slots), float(self.peak_parse_mb),
              int(self.subprocess_slots) * float(self.peak_parse_mb)),
+            # 曾经漏了这一项：HLS 分片池自建线程、自成并发，却不在内存自证里
+            # （自有审计：「内存自证漏了它」）。漏一项 = 自证不成立。
+            ("hls", int(self.hls_segments), float(self.peak_hls_mb),
+             int(self.hls_segments) * float(self.peak_hls_mb)),
             ("browser", int(self.browser_contexts), float(self.peak_browser_mb),
              int(self.browser_contexts) * float(self.peak_browser_mb)),
             ("writer", int(self.writer_threads), float(self.peak_download_mb),
@@ -110,7 +124,8 @@ class ResourcePlan:
             problems.append(f"批提交行数应在 500–2000（当前 {self.batch_rows}）")
         if float(self.flush_interval) > 2.0:
             problems.append(f"批提交间隔过长（{self.flush_interval}s）；应 ≤2s 或按行数触发")
-        for name in ("download_threads", "parse_threads", "reparse_processes"):
+        for name in ("download_threads", "parse_threads", "reparse_processes",
+                     "subprocess_slots", "hls_segments"):
             if int(getattr(self, name)) < 0:
                 problems.append(f"{name} 不能为负（{getattr(self, name)}）")
         total = self.memory_total_mb()
