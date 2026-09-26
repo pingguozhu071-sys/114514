@@ -23,13 +23,15 @@
 from __future__ import annotations
 
 import logging
+import re
 
 from daedalus.ui.i18n import translator
 from daedalus.ui.widgets import GlassCard, PageBase, StatCard
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["build_pages", "page_titles", "PAGE_KEYS", "task_detail_text", "LOG_VIEW_MAX"]
+__all__ = ["build_pages", "page_titles", "PAGE_KEYS", "task_detail_text", "LOG_VIEW_MAX",
+           "read_txt_text", "extract_url_from_line", "parse_txt_links", "group_urls_by_domain"]
 
 # 页面键与**文案键**（标题从文案表取，不再写死）
 PAGE_KEYS = ("overview", "tasks", "logs", "settings", "about")
@@ -142,6 +144,95 @@ def _overview(window, tokens, ctx, t):
     return page
 
 
+# ── TXT 链接导入（机主原话：直接提取 txt 里面的链接…一行一个…断掉的排除…小分类过滤）──
+# URL 记号：从 http(s):// 起，到**空白或 CJK 字符/标点**为止——中文排版里标题常紧贴
+# 逗号（形如「https://a/b，标题」），只按空白截断会把整段标题吃进记号；半角括号**不在**
+# 排除集里，维基式 URL（/wiki/X_(Y)）不会被截坏。raw 字符串里的 \uXXXX 由 re 解释。
+_URL_TOKEN_RE = re.compile(
+    r"https?://[^\s\u3000-\u303f\uff00-\uffef\u2018-\u201f\u2026\u4e00-\u9fff]+")
+
+# 行尾要剥的中文标点（机主点名的「，。；、）」】 等」；都在上面的排除集里，这里只是兜底）
+_TRAILING_PUNCT = "，。；、！？）」』】〉》…·"
+
+
+def read_txt_text(path) -> str:
+    """读 TXT 并探测编码：有 BOM 按 utf-8-sig / utf-16 → 否则依次试 utf-8、gbk。
+
+    都解不开时用 utf-8 + replace 兜底（链接是 ASCII 的，个别乱码字不伤提取；
+    整个文件直接报失败反而更不诚实——里面明明还有能用的链接）。
+    """
+    import pathlib
+    data = pathlib.Path(str(path)).read_bytes()
+    if data.startswith(b"\xef\xbb\xbf"):
+        return data.decode("utf-8-sig", errors="replace")
+    if data.startswith(b"\xff\xfe") or data.startswith(b"\xfe\xff"):
+        return data.decode("utf-16")                 # 带 BOM 的 utf-16 自动判端序
+    for enc in ("utf-8", "gbk"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def extract_url_from_line(line: str) -> str:
+    """从一行里提取**第一个 http(s):// 记号**；容忍「1. url 标题」这类前后缀。"""
+    m = _URL_TOKEN_RE.search(str(line))
+    if m is None:
+        return ""
+    tok = m.group(0)
+    while tok and tok[-1] in _TRAILING_PUNCT:        # 剥掉行尾标点（，。；、）」】 等）
+        tok = tok[:-1]
+    return tok
+
+
+def _url_host(tok: str) -> str:
+    """取记号的域名部分（scheme 之后、第一个 / ？# 之前）。"""
+    rest = tok.split("://", 1)[1] if "://" in tok else ""
+    return rest.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+
+
+def _valid_url_token(tok: str) -> bool:
+    """机主的校验：scheme 是 http/https、域名非空、记号无空白——缺一即「断掉的链接」。"""
+    if not tok or not (tok.startswith("http://") or tok.startswith("https://")):
+        return False
+    if any(ch.isspace() for ch in tok):
+        return False
+    return bool(_url_host(tok))
+
+
+def parse_txt_links(text: str) -> dict:
+    """TXT 文本 → 采集目标清单（**纯函数**，界面与门禁共用同一套口径）。
+
+    逐行提取 → 无效排除（M）→ 去重保序（D）→ 剩下的就是导入清单（N，保持首次出现顺序）；
+    域名集合单独给出（K），供「小分类过滤」按域名分组输出。
+    """
+    urls: list[str] = []
+    invalid = dup = 0
+    for raw in str(text).splitlines():
+        line = raw.strip()
+        if not line:
+            continue                                  # 空行不算链接、也不算失败
+        tok = extract_url_from_line(line)
+        if not _valid_url_token(tok):
+            invalid += 1
+            continue
+        if tok in urls:
+            dup += 1
+            continue
+        urls.append(tok)
+    domains = sorted({_url_host(u) for u in urls})
+    return {"urls": urls, "invalid": invalid, "dup": dup, "domains": domains}
+
+
+def group_urls_by_domain(urls) -> str:
+    """「小分类过滤」的输出：按域名分组、域名排序、组间空行（collect 本来就跳过空行）。"""
+    groups: dict[str, list[str]] = {}
+    for u in urls:
+        groups.setdefault(_url_host(u), []).append(u)
+    return "\n\n".join("\n".join(groups[d]) for d in sorted(groups))
+
+
 def _quick_collect(page, tokens, ctx, t):
     """概览页的**快速采集**卡：贴一批目标 → 开始 → 看指标动 → 可停。
 
@@ -150,7 +241,10 @@ def _quick_collect(page, tokens, ctx, t):
 
     * 采集跑在**独立线程**里（`ctx.engine.run_targets` 会开自己的 worker），界面只读进度；
     * 「停止」走 `stop_event`：worker 下一轮领取前退出，**已领走的租约不丢**（会超时回队列）；
-    * 引擎没起来时按钮**禁用**并说明原因（不是点了没反应）。
+    * 引擎没起来时按钮**禁用**并说明原因（不是点了没反应）；
+    * 「导入 TXT」：文件对话框只收 *.txt；编码探测（BOM → utf-8 → gbk）+ 逐行提取
+      第一个 http(s):// 记号 + 无效排除 + 去重保序，再按域名分组（小分类过滤）写进文本框，
+      状态栏与通知**如实回报**「导入 N 条（排除 M 条无效，去重 D 条），K 个域名」。
     """
     from PySide6.QtWidgets import QPlainTextEdit, QHBoxLayout, QPushButton
     card = GlassCard.make(tokens, name="card")
@@ -162,12 +256,15 @@ def _quick_collect(page, tokens, ctx, t):
     box.setFixedHeight(64)                       # 规格里的多行框高度
     cl.addWidget(box)
     row = QHBoxLayout()
+    imp = QPushButton(t("collect.import_txt"), card)
+    imp.setObjectName("collectImport")
     start = QPushButton(t("collect.start"), card)
     start.setObjectName("collectStart")
     stop = QPushButton(t("collect.stop"), card)
     stop.setObjectName("collectStop")
     stop.setEnabled(False)
     status = _label(t("collect.idle"), tokens, muted=True)
+    row.addWidget(imp)
     row.addWidget(start)
     row.addWidget(stop)
     row.addWidget(status, 1)
@@ -242,12 +339,44 @@ def _quick_collect(page, tokens, ctx, t):
         stop.setEnabled(False)
         status.setText(t("collect.stopping"))
 
+    def _import_txt() -> None:
+        """导入 TXT：探测编码 → 提取/排除/去重 → 按域名分组写进文本框 → 如实回报计数。
+
+        每一步都**不静默**：读不出、没找到链接、导入成功，三种结局都落到状态栏 + 通知。
+        """
+        from PySide6.QtWidgets import QFileDialog
+        import pathlib
+        path, _ = QFileDialog.getOpenFileName(None, t("dialog.pick_txt"), "",
+                                              f"{t('dialog.txt_filter')} (*.txt)")
+        if not path:
+            return
+        try:
+            text = read_txt_text(path)
+        except Exception as e:                       # 读不出来要看得见（权限/被删等）
+            msg = t("collect.import_failed", err=f"{type(e).__name__}: {e}")
+            status.setText(msg)
+            _toast(ctx, msg, error=True)
+            return
+        parsed = parse_txt_links(text)
+        if not parsed["urls"]:
+            msg = t("collect.import_none", name=pathlib.Path(str(path)).name)
+            status.setText(msg)
+            _toast(ctx, msg)
+            return
+        box.setPlainText(group_urls_by_domain(parsed["urls"]))
+        msg = t("collect.import_done", n=len(parsed["urls"]), m=parsed["invalid"],
+                d=parsed["dup"], k=len(parsed["domains"]))
+        status.setText(msg)
+        _toast(ctx, msg)
+
     bridge.finished.connect(_on_finished)
     start.clicked.connect(_start)
     stop.clicked.connect(_stop)
+    imp.clicked.connect(_import_txt)
     page._refresh_collect = _refresh_status       # noqa: SLF001 - 轮询里顺手刷新「运行 N 秒」
     page._collect_bridge = bridge                 # noqa: SLF001 - 防被 GC + 便于门禁查看
-    page._collect = {"start": start, "stop": stop, "box": box, "status": status}   # noqa: SLF001
+    page._collect = {"start": start, "stop": stop, "box": box, "status": status,
+                     "import": imp}                # noqa: SLF001
     return card
 
 

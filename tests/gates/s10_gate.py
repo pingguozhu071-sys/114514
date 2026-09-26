@@ -100,7 +100,7 @@ def t_single_generator():
     b = ui()
     t65 = tokens(panel_alpha=65)
     t40 = tokens(panel_alpha=40)
-    # 同 objectName → 同 QSS（不是"看起来差不多"，是逐字符相同）
+    # 同 objectName → 同 QSS（不是「看起来差不多」，是逐字符相同）
     for name in ("card", "statCard", "settingsCard", "taskCard"):
         assert card_qss(t65, name) == card_qss(t65, name), name
         assert card_qss(t65, name) != card_qss(t40, name), f"{name} 没跟着 alpha 变"
@@ -295,8 +295,8 @@ def t_perf():
     from perf_probe import probe
     rep = probe(real=False, out=_TMP / "perf.json")
     bad = [c for c in rep["checks"] if not c["ok"]]
-    # **机器忙时（比如长跑在跑）这些数字测不准**：把"负载"当成一等事实报出来，
-    # 而不是让"机器忙"伪装成"性能回归"（实测踩过：同一套代码在负载下停顿超线，
+    # **机器忙时（比如长跑在跑）这些数字测不准**：把「负载」当成一等事实报出来，
+    # 而不是让「机器忙」伪装成「性能回归」（实测踩过：同一套代码在负载下停顿超线，
     # 白查了一轮发现是后台长跑抢 CPU）。
     if bad and not rep.get("measurement_trustworthy", True):
         return skip(f"机器负载 {rep.get('machine_load_pct')}%（>50%）——停顿时延不可信；"
@@ -441,9 +441,9 @@ def t_ui_boundary():
 
 
 # ══════════════════════════════════════════════════════════════════
-# E. 接线与多语言（机主要求："测一下 UI…别犯低级错误"、"装完别蹦出别的语言"）
+# E. 接线与多语言（机主要求：「测一下 UI…别犯低级错误」「装完别蹦出别的语言」）
 #    这一组是**走查抓出来的教训**：组件都对、**接线没接**，测组件永远测不出来
-#    （原来 S10 是拿 set_wallpaper 直接测的，于是"设置里存了底图但界面不加载"这种 bug 一直假绿）。
+#    （原来 S10 是拿 set_wallpaper 直接测的，于是「设置里存了底图但界面不加载」这种 bug 一直假绿）。
 # ══════════════════════════════════════════════════════════════════
 @case("E1 接线存在：两条启动路径都必须装上「设置一变 → 界面跟着变」的处理器")
 def t_context_wired():
@@ -795,7 +795,7 @@ def t_logs_page_live():
     assert "门禁探针" in text and "hello" in text, f"日志没进面板：{text[-200:]!r}"
     assert "SECRET123456" not in text, "面板里的凭据没有被脱敏（红线）"
     assert "[REDACTED]" in text or "REDACTED" in text, text[-200:]
-    # 界面自己的提示也要能看到（原来是"用户永远不知道为什么不生效"）
+    # 界面自己的提示也要能看到（原来是「用户永远不知道为什么不生效」）
     win._ui["ctx"].notify("门禁探针：设置被拒", error=True)     # noqa: SLF001
     t0 = time.perf_counter()
     while time.perf_counter() - t0 < 1.2:
@@ -988,6 +988,119 @@ def t_nav_items_all():
     MainWindow.apply_locale(win, "zh-CN")
     return ok(f"五个导航项齐全（{list(items)}）；页面 objectName 唯一（{names[0]} …）；"
               f"换语言后仍是五项（日文标题示例：{r['nav'][:2]}）")
+
+
+@case("E14 TXT 导入：*.txt 过滤 + 编码探测 + 提取/排除/去重/按域名分组（真点按钮）")
+def t_txt_import():
+    """机主原话：「搞一个直接提取 txt 里面的链接…一行一个…断掉的链接排除掉…
+    小分类过滤…只适配 txt 就行」。这条门禁把**真按钮**点一遍（对话框打桩，与 E12 同款）：
+    断言文本框内容、排除/去重计数、按域名分组的输出——计数口径与 `parse_txt_links` 一致。
+    """
+    from PySide6.QtWidgets import QFileDialog
+    from daedalus.ui.i18n import translator
+    b = _fresh_window()
+    win, app, ctx = b["window"], b["app"], b["window"]._ui["ctx"]   # noqa: SLF001
+    c = getattr(win._ui["pages"]["overview"], "_collect", None)      # noqa: SLF001
+    assert c and c.get("import") is not None, "概览页没有「导入 TXT」按钮"
+    assert c["import"].isEnabled(), "导入按钮应当可用（不依赖引擎）"
+
+    picked = {"path": "", "filter": ""}
+
+    def _stub_dialog(*a, **k):
+        picked["filter"] = str(a[3]) if len(a) > 3 else str(k.get("filter", ""))
+        return (picked["path"], "")
+
+    QFileDialog.getOpenFileName = staticmethod(_stub_dialog)         # E14/E15 之后无用例，不恢复
+    tz = translator("zh-CN")                                         # _fresh_window 默认 zh-CN
+    txt = _TMP / "e14_links.txt"
+    txt.write_text("\n".join([
+        "https://alpha.test/a",
+        "1. https://beta.test/b 标题",
+        "https://alpha.test/a",
+        "不是链接的一行",
+        "https://",
+        "https://alpha.test/a。",
+        "",
+    ]), encoding="utf-8")
+    picked["path"] = str(txt)
+    c["import"].click()
+    app.processEvents()
+    assert "*.txt" in picked["filter"], f"文件过滤器没限定 *.txt：{picked['filter']!r}"
+    # 期望：有效 2（含「1. url 标题」前后缀）、重复 2、无效 2（纯文本行 + 裸 scheme），
+    # 域名 2 个 → 按域名排序分组、组间空行
+    assert c["box"].toPlainText() == "https://alpha.test/a\n\nhttps://beta.test/b", \
+        repr(c["box"].toPlainText())
+    msg = tz("collect.import_done", n=2, m=2, d=2, k=2)
+    assert c["status"].text() == msg, c["status"].text()
+    assert msg in ctx.notes, ctx.notes[-2:]
+    # 编码探测：gbk / utf-16（带 BOM）/ utf-8-sig（带 BOM）各走一遍真按钮
+    for name, enc, line, want in (
+            ("gbk", "gbk", "1. https://gbk.test/x，示例", "https://gbk.test/x"),
+            ("utf-16", "utf-16", "https://utf16.test/y", "https://utf16.test/y"),
+            ("utf-8-sig", "utf-8-sig", "https://bom.test/z", "https://bom.test/z")):
+        p = _TMP / f"e14_{name}.txt"
+        p.write_text(line + "\n", encoding=enc)
+        picked["path"] = str(p)
+        c["import"].click()
+        app.processEvents()
+        assert c["box"].toPlainText() == want, (name, repr(c["box"].toPlainText()))
+    # 一个链接都没有 → 如实说「没找到」，且**不动**文本框里已有的内容
+    p = _TMP / "e14_empty.txt"
+    p.write_text("你好世界\n", encoding="utf-8")
+    picked["path"] = str(p)
+    c["import"].click()
+    app.processEvents()
+    assert c["box"].toPlainText() == "https://bom.test/z", "没找到链接时不应清空文本框"
+    assert any("没有找到可用链接" in n for n in ctx.notes), ctx.notes[-2:]
+    return ok("*.txt 过滤｜gbk/utf-16/utf-8-sig 编码探测｜有效 2、排除 2、去重 2、域名 2｜"
+              "按域名分组（组间空行）｜没找到时如实提示且不动文本框")
+
+
+@case("E15 语言切换条：标题栏里、可点、当前语言高亮不可点、整页重建后仍在")
+def t_langbar():
+    """机主给的图：English | 简体中文 —— 文字链接 + 竖线分隔。条挂在标题栏（窗口控制
+    按钮左边），点链接 = 存 settings 的 locale + 走现有 apply_locale 整页重建；
+    换语言重建后语言条必须还在、当前高亮必须跟过去；几何上**不许与窗口按钮重叠**。
+    """
+    from daedalus.ui.i18n import translator
+    b = _fresh_window()
+    win, app, store = b["window"], b["app"], b["settings"]
+    win.show()                                        # 几何验证需要真实布局
+    app.processEvents()
+    info = win._ui                                                   # noqa: SLF001
+    lb = info.get("langbar")
+    assert lb is not None, "窗口没有语言切换条"
+    assert lb.parent() is win.titleBar, "语言条没有插进标题栏"
+    assert set(lb.links) == {"en-US", "zh-CN", "ja-JP"}, set(lb.links)
+    assert [lb.links[k].text() for k in ("en-US", "zh-CN", "ja-JP")] == \
+        ["English", "简体中文", "日本語"], "语言名必须是母语原文（不走 i18n）"
+    # 几何验证：与 min/max/close 不重叠（两条路径共用同一验证器）
+    bad = info["langbar_check"]()
+    assert not bad, f"语言条与窗口按钮重叠：{bad}（mode={info['langbar_mode']}）"
+    # 当前语言（zh-CN）：加粗 + 强调色 + 不可点；其余两个可点
+    cur = lb.links[info["tokens"].locale]
+    assert cur.isEnabled() is False and "font-weight: 700" in cur.styleSheet(), cur.styleSheet()
+    assert info["tokens"].accent in cur.styleSheet(), cur.styleSheet()
+    assert lb.links["en-US"].isEnabled() and lb.links["ja-JP"].isEnabled()
+    # 点 English → 标题/导航/存储三处都变英文
+    lb.links["en-US"].click()
+    app.processEvents()
+    t_en = translator("en-US")
+    assert t_en("app.title") in win.windowTitle(), win.windowTitle()
+    assert info["nav_items"]["overview"].text() == t_en("nav.overview") == "Overview"
+    assert store.get("locale") == "en-US", store.get("locale")
+    assert info["langbar"] is lb and lb.parent() is win.titleBar, "整页重建后语言条丢了"
+    assert not info["langbar_check"](), "重建后几何验证失败"
+    # 点 日本語 → 日文；当前高亮跟过去、原来那个恢复可点
+    lb.links["ja-JP"].click()
+    app.processEvents()
+    assert translator("ja-JP")("app.title") in win.windowTitle(), win.windowTitle()
+    assert info["nav_items"]["overview"].text() == "概要"
+    cur2 = lb.links["ja-JP"]
+    assert not cur2.isEnabled() and "font-weight: 700" in cur2.styleSheet()
+    assert lb.links["en-US"].isEnabled(), "切到日文后 English 应当恢复可点"
+    return ok(f"mode={info['langbar_mode']}；点 English/日本語 后标题、导航、存储三处跟随；"
+              f"当前语言加粗+强调色+不可点；整页重建后语言条仍在且不与窗口按钮重叠")
 
 
 # ══════════════════════════════════════════════════════════════════

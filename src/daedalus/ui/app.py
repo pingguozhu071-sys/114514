@@ -70,7 +70,7 @@ class MainWindow:
 
     @staticmethod
     def make(*, ctx: UI, tokens, app=None):
-        from PySide6.QtCore import QEvent
+        from PySide6.QtCore import QEvent, Qt
         from PySide6.QtGui import QColor, QPainter
         from PySide6.QtWidgets import QApplication, QWidget
         from qfluentwidgets import (FluentIcon, FluentWindow, NavigationItemPosition,
@@ -154,6 +154,23 @@ class MainWindow:
             logger.debug("导航展开失败（保持库默认的图标条）：%s", e)
 
         sig = SignatureLabel.make(tokens, win)
+        # 语言切换条：先试插进库的标题栏布局（窗口按钮左边），插不进去就退回悬浮
+        # （两条路径的取舍与几何验证见 `_make_langbar` / `_langbar_overlaps` 的说明）
+        langbar = _make_langbar(win, tokens, ctx)
+        langbar_mode = "float"
+        _tb = getattr(win, "titleBar", None)
+        _hb = getattr(_tb, "hBoxLayout", None) if _tb is not None else None
+        if _hb is not None:
+            try:
+                # 库 1.11.3：hBoxLayout 的最后一项是装着 min/max/close 的 vBoxLayout——
+                # 插到它前面 = 窗口控制按钮左边（机主要的位置）
+                _hb.insertWidget(max(0, _hb.count() - 1), langbar, 0,
+                                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                langbar_mode = "titlebar"
+            except Exception as e:
+                logger.debug("语言条插标题栏失败（退回悬浮）：%s", e)
+        if langbar_mode == "float":
+            langbar.adjustSize()
         state = {"page": order[0], "switch_ms": {}, "applied": {}, "tokens": tokens}
 
         def _goto(key: str) -> None:
@@ -169,12 +186,18 @@ class MainWindow:
                 ctx.settings.set("page", key)
 
         def _sync_vars() -> dict:
-            """窗口几何变化后同步子层（签名贴右下 + 底图重绘）。"""
+            """窗口几何变化后同步子层（签名贴右下 + 悬浮语言条贴标题栏下缘 + 底图重绘）。"""
             r = win.rect()
             sig.adjustSize()
             sig.move(max(0, r.width() - sig.width() - 16),
                      max(0, r.height() - sig.height() - 10))
             sig.raise_()
+            if langbar_mode == "float":              # 悬浮语言条：与签名同一套定位纪律
+                langbar.adjustSize()
+                tb_h = getattr(getattr(win, "titleBar", None), "height", lambda: 48)()
+                langbar.move(max(0, r.width() - langbar.width() - 16),
+                             max(0, int(tb_h) + 4))
+                langbar.raise_()
             return {"w": r.width(), "h": r.height()}
 
         def _on_change_handler(event=None) -> None:
@@ -187,6 +210,8 @@ class MainWindow:
         win._ui = {"ctx": ctx, "tokens": tokens, "pages": pages, "order": order,
                    "stack": getattr(win, "stackedWidget", None), "nav": win.navigationInterface,
                    "nav_items": nav_items, "buttons": nav_items, "bg": win, "sig": sig,
+                   "langbar": langbar, "langbar_mode": langbar_mode,
+                   "langbar_check": (lambda: _langbar_overlaps(win, langbar)),
                    "state": state, "goto": _goto, "sync": _sync_vars,
                    "apply_theme": apply_theme, "icons": icons}   # noqa: SLF001
 
@@ -216,13 +241,19 @@ class MainWindow:
         WallpaperWidget.tokens_of(win, tokens)           # 底图动效（溶解/限帧）读这份令牌
         info["sig"].setVisible(bool(tokens.signature))
         info["sig"].setStyleSheet(f"color: {tokens.accent}; background: transparent;")
+        lb = info.get("langbar")
+        if lb is not None:                           # 强调色/主题变了 → 语言条样式跟着刷
+            try:
+                lb.set_current(str(getattr(tokens, "locale", "") or ""), tokens)
+            except Exception as e:
+                logger.debug("语言条样式刷新失败：%s", e)
         info["sync"]()
         win.update()
         return dict(info["applied"])
 
     @staticmethod
     def wire_context(win, store, ctx=None) -> dict:
-        """把"设置一变 → 界面跟着变"这条线**接一次**（两条启动路径共用，避免漂移）。
+        """把「设置一变 → 界面跟着变」这条线**接一次**（两条启动路径共用，避免漂移）。
 
         走查发现的两个真问题（都是「组件都对、接线没接」，测组件测不出来）：
           * `build_headless` 根本没人装变更处理器 → **所有设置只存了盘、界面纹丝不动**；
@@ -254,7 +285,7 @@ class MainWindow:
                 MainWindow.apply_wallpaper_from_settings(win, store, tokens_now)
             # 自动取色只在两种情况下跑：**换了底图** 或 **刚解除锁定**。
             # ⚠️ 用户显式选了强调色（`accent` 在 patch 里）时**绝不能覆盖**——那是明确选择；
-            #    走查抓到的 bug 就是"我选了颜色它自己变回去了"（自动取色盖掉显式选择）。
+            #    走查抓到的 bug 就是「我选了颜色它自己变回去了」（自动取色盖掉显式选择）。
             unlocked = not store.get("accent_locked")
             if unlocked and (bg_changed or ("accent_locked" in patch)):
                 MainWindow.sync_accent_from_wallpaper(win, store, tokens_now)
@@ -429,6 +460,12 @@ class MainWindow:
         info["buttons"] = nav_items                      # 兼容旧键名（门禁/走查读它）
         win.setWindowTitle(f"{display_name(locale)} · {t('app.title')}")
         info["sig"].setText(t("app.signature", name=display_name(locale), version=VERSION))
+        lb = info.get("langbar")
+        if lb is not None:                           # 语言条不重建（挂在标题栏上），但高亮要跟
+            try:
+                lb.set_current(locale)
+            except Exception as e:
+                logger.debug("语言条刷新失败：%s", e)
         cur = info["state"].get("page")
         info["goto"](cur if cur in order else order[0])
         return {"locale": locale, "order": order, "title": win.windowTitle(),
@@ -469,7 +506,7 @@ class MainWindow:
             StatCard.set_value(cards[2], f"{int(s.get('tasks_done', 0))}/"
                                         f"{int(s.get('tasks_failed', 0))}")
             StatCard.set_value(cards[3], f"{s.get('net_latency_p95', 0) * 1000:.0f} ms")
-        # 快速采集的"运行中 N 秒"也在这一波里刷（不然状态会一直停在初始值）
+        # 快速采集的「运行中 N 秒」也在这一波里刷（不然状态会一直停在初始值）
         try:
             fn = getattr(pages["overview"], "_refresh_collect", None)
             if callable(fn):
@@ -500,6 +537,115 @@ class MainWindow:
                 "scheduler": st, "wallpaper_meta": dict(info["state"].get("wallpaper_meta") or {}),
                 "size": [win.width(), win.height()],
                 "signature_visible": bool(info["sig"].isVisible())}
+
+
+def _langbar_overlaps(win, widget) -> list[str]:
+    """几何验证：语言切换条与窗口控制按钮（min/max/close）的矩形**不许相交**。
+
+    两条路径都过这里：插进标题栏的（布局上就在按钮左边）与悬浮的（`_sync_vars` 定位）。
+    返回与语言条相交的按钮名列表（空 = 通过）。
+    """
+    from PySide6.QtCore import QPoint, QRect
+    tb = getattr(win, "titleBar", None)
+    if tb is None or widget is None:
+        return ["titlebar-missing"]
+    bar_r = QRect(widget.mapTo(win, QPoint(0, 0)), widget.size())
+    if bar_r.width() <= 0 or bar_r.height() <= 0:
+        return ["zero-size"]
+    bad: list[str] = []
+    for name in ("minBtn", "maxBtn", "closeBtn"):
+        b = getattr(tb, name, None)
+        if b is None:
+            continue
+        r = QRect(b.mapTo(win, QPoint(0, 0)), b.size())
+        if bar_r.intersects(r):
+            bad.append(name)
+    return bad
+
+
+def _make_langbar(win, tokens, ctx):
+    """标题栏右侧的语言切换条：English ｜ 简体中文 ｜ 日本語（照机主给的图样式）。
+
+    语言名用**各自母语原文**（不走 i18n——不管界面是什么语言，这三个名字永远原样）。
+    首选往库的 FluentTitleBar 布局里插：1.11.3 的 `hBoxLayout` 最后一项是装着
+    min/max/close 的 vBoxLayout，插到它前面 = 窗口控制按钮**左边**；插不进去（布局
+    结构变了/没有该属性）就退回「标题栏下方右上角悬浮小部件」（像签名那样在
+    `_sync_vars` 里定位）。两条路径都经 `_langbar_overlaps` 做几何验证。
+
+    点击 = 存 settings 的 locale + 走现有 apply_locale 整页重建机制（与设置页的
+    语言下拉同一条通路，不另起炉灶）。
+    """
+    from PySide6.QtCore import Qt, Signal
+    from PySide6.QtWidgets import QHBoxLayout, QLabel, QWidget
+    from daedalus.ui.i18n import LOCALE_NAMES
+
+    class _Link(QLabel):
+        """文字链接：左键点击 = 激活；`click()` 让门禁/走查在无头环境也能真点一遍。"""
+        activated = Signal(str)
+
+        def __init__(self, loc: str, parent):
+            super().__init__(LOCALE_NAMES.get(loc, loc), parent)
+            self._loc = str(loc)                     # noqa: SLF001
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        def mousePressEvent(self, ev):               # noqa: N802 - Qt 命名
+            if ev.button() == Qt.MouseButton.LeftButton and self.isEnabled():
+                self.activated.emit(self._loc)
+            super().mousePressEvent(ev)
+
+        def click(self) -> None:                     # 与 QPushButton.click 同名同义（测试用）
+            if self.isEnabled():
+                self.activated.emit(self._loc)
+
+    bar = QWidget(win)
+    bar.setObjectName("langBar")
+    lay = QHBoxLayout(bar)
+    lay.setContentsMargins(10, 0, 12, 0)
+    lay.setSpacing(6)
+    links: dict = {}
+    order = ("en-US", "zh-CN", "ja-JP")              # 机主图上的顺序：English ｜ 简体中文 ｜ 日本語
+    for i, loc in enumerate(order):
+        if i:
+            sep = QLabel("｜", bar)                  # 全角竖线：照图样式的分隔符
+            sep.setStyleSheet("QLabel { background: transparent; }")
+            lay.addWidget(sep)
+        link = _Link(loc, bar)
+        link.activated.connect(lambda loc=loc: _activate(loc))
+        lay.addWidget(link)
+        links[loc] = link
+
+    def _activate(loc: str) -> None:
+        store = getattr(ctx, "settings", None)
+        try:
+            if store is not None:
+                store.update({"locale": loc})        # 即改即存（与设置页语言下拉同一写法）
+        except Exception as e:
+            logger.debug("语言保存失败：%s", e)
+        if getattr(ctx, "_on_change", None) is not None:       # noqa: SLF001
+            ctx.on_settings_changed({"locale": loc})   # 设置一变 → 整页重建（现有机制）
+        else:                                        # 接线还没装上（不应发生）：直接重建
+            MainWindow.apply_locale(win, loc)
+
+    def set_current(cur: str, tk=None) -> None:
+        """刷新高亮：当前语言加粗 + 强调色 + 禁用（不可点），其余普通样式、可点。"""
+        from daedalus.ui.theme import text_color
+        tk = tk or tokens
+        for loc, link in links.items():
+            if loc == str(cur or ""):
+                link.setEnabled(False)
+                link.setStyleSheet(f"QLabel {{ color: {tk.accent}; font-weight: 700;"
+                                   " background: transparent; }")
+            else:
+                link.setEnabled(True)
+                link.setStyleSheet(f"QLabel {{ color: {text_color(tk.light)};"
+                                   " background: transparent; }"
+                                   "QLabel:hover { text-decoration: underline; }")
+        bar.adjustSize()
+
+    set_current(str(getattr(tokens, "locale", "") or ""))
+    bar.links = links                                # noqa: SLF001 - 门禁/走查按名取
+    bar.set_current = set_current                    # noqa: SLF001
+    return bar
 
 
 def _fill_task_table(win, rows: list) -> None:

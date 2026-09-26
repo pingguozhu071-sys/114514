@@ -13,7 +13,10 @@
   * **自动取色**：给三张特征图（紫/灰/彩噪）断言取到预期色或**如实回退并说明**；
   * **不拥挤**（照 Kiana 规格）：间距数字逐项核对 + 卡片几何不重叠 + 卡片间距 > 卡内间距；
   * **不混语言**：切到 ja-JP / en-US 后，断言界面上不再出现 zh-CN 的专属文案
-    （机主点名的「装完蹦日文/中文混着」那类低级错误）。
+    （机主点名的「装完蹦日文/中文混着」那类低级错误）；
+  * **导入 TXT**：真点「导入 TXT」按钮（对话框打桩），断言提取/排除/去重/按域名分组；
+  * **语言切换条**：经标题栏的链接（English ｜ 简体中文 ｜ 日本語）真切语言，
+    断言标题/导航/存储跟随、当前语言高亮不可点、与窗口按钮不重叠。
 退出码 0 = 全部通过。
 """
 
@@ -82,7 +85,7 @@ def walk(*, verbose: bool = True) -> dict:
         return (str(preset_out) if ("预设" in title or "preset" in title.lower())
                 else str(noise), "")
     QFileDialog.getOpenFileName = staticmethod(_open_stub)
-    # 「删除任务记录」的确认框：默认**点「否」**（走查先验"没确认不许删"这条路）。
+    # 「删除任务记录」的确认框：默认**点「否」**（走查先验「没确认不许删」这条路）。
     # 需要验「是」的分支时，测试里再把这个桩改成 Yes。
     QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.StandardButton.No)
 
@@ -353,13 +356,85 @@ def walk(*, verbose: bool = True) -> dict:
         check("任务页三操作走查可用", False, "没有工具行或表格为空")
     ui["ctx"].engine = None
 
+    # ── L. 导入 TXT：**真点一遍**「导入 TXT」按钮（对话框打桩，与上面同一套纪律）──
+    #    机主原话：「直接提取 txt 里面的链接…断掉的排除…小分类过滤」。走查与门禁 E14
+    #    同一口径：有效 2 / 无效排除 2 / 去重 2 / 域名 2，输出按域名分组、组间空行。
+    page = ui["pages"]["overview"]                     # 语言走查段可能重建过页面，现取现用
+    c = getattr(page, "_collect", None)
+    if c and c.get("import") is not None:
+        txt = root / "walk_links.txt"
+        txt.write_text("\n".join([
+            "https://alpha.test/a",
+            "1. https://beta.test/b 标题",
+            "https://alpha.test/a",
+            "不是链接的一行",
+            "https://",
+            "https://alpha.test/a。",
+            "",
+        ]), encoding="utf-8")
+        picked = {"filter": ""}
+
+        def _txt_stub(*a, **k):
+            picked["filter"] = str(a[3]) if len(a) > 3 else ""
+            return (str(txt), "")
+
+        QFileDialog.getOpenFileName = staticmethod(_txt_stub)   # 走查已到最后一段，覆盖无碍
+        c["import"].click()
+        app.processEvents()
+        want_box = "https://alpha.test/a\n\nhttps://beta.test/b"
+        want_msg = translator("zh-CN")("collect.import_done", n=2, m=2, d=2, k=2)
+        got_box = c["box"].toPlainText()
+        check("导入 TXT：*.txt 过滤 + 提取/排除/去重/按域名分组（真点按钮）",
+              "*.txt" in picked["filter"] and got_box == want_box
+              and c["status"].text() == want_msg and want_msg in ui["ctx"].notes,
+              f"filter={picked['filter']!r} box={got_box!r} status={c['status'].text()!r}")
+    else:
+        check("导入 TXT 走查可用", False, "概览页没有「导入 TXT」按钮")
+
+    # ── M. 语言切换条：**经链接**切语言（机主图样式：English ｜ 简体中文 ｜ 日本語）──
+    #    链接在标题栏里（窗口控制按钮左边），当前语言加粗+强调色+不可点；点链接 =
+    #    存 settings 的 locale + 整页重建（与设置页下拉同一条通路）。
+    lb = ui.get("langbar")
+    if lb is not None and getattr(lb, "links", None):
+        order = ("en-US", "zh-CN", "ja-JP")
+        texts = [lb.links[k].text() for k in order]
+        cur0 = lb.links.get(str(ui["tokens"].locale))
+        hl_ok = cur0 is not None and not cur0.isEnabled() and "font-weight: 700" in cur0.styleSheet()
+        check("语言切换条：三个母语原文链接 + 当前语言加粗不可点",
+              texts == ["English", "简体中文", "日本語"] and hl_ok,
+              f"texts={texts} current={ui['tokens'].locale!r}")
+        lb.links["en-US"].click()
+        app.processEvents()
+        check("经链接切到 English：标题/导航/存储跟随、整页重建后语言条仍在",
+              translator("en-US")("app.title") in win.windowTitle()
+              and ui["nav_items"]["overview"].text() == "Overview"
+              and store.get("locale") == "en-US" and ui.get("langbar") is lb,
+              f"title={win.windowTitle()!r} nav={ui['nav_items']['overview'].text()!r} "
+              f"locale={store.get('locale')!r}")
+        lb.links["ja-JP"].click()
+        app.processEvents()
+        check("经链接切到 日本語：高亮跟过去、其余恢复可点",
+              "統合収集・観測エンジン" in win.windowTitle()
+              and ui["nav_items"]["overview"].text() == "概要"
+              and not lb.links["ja-JP"].isEnabled() and lb.links["en-US"].isEnabled(),
+              f"nav={ui['nav_items']['overview'].text()!r}")
+        overlap = ui["langbar_check"]()
+        check("语言切换条不与窗口控制按钮重叠", not overlap,
+              f"mode={ui.get('langbar_mode')} overlap={overlap}")
+        lb.links["zh-CN"].click()                       # 收尾切回默认语言（顺手验第三个链接）
+        app.processEvents()
+        check("经链接切回 简体中文", store.get("locale") == "zh-CN",
+              f"locale={store.get('locale')!r}")
+    else:
+        check("语言切换条走查可用", False, "窗口没有语言切换条")
+
     total = len(RESULTS)
     failed = [r for r in RESULTS if not r["ok"]]
     return {"total": total, "failed": len(failed), "ok": not failed,
             "results": RESULTS, "locale_detected": b["tokens"].locale,
             "note": "界面实操走查（offscreen）：逐页进入 + 每个控件走真实信号 + 背景图真路径 + "
                     "三张特征图取色 + Kiana 间距规格 + 几何不重叠 + 语言不混 + 按钮全点一遍 + "
-                    "任务页三操作（重试/导出/删除确认）"}
+                    "任务页三操作（重试/导出/删除确认）+ 导入 TXT（真点按钮）+ 经标题栏链接切语言"}
 
 
 def main(argv: list[str] | None = None) -> int:

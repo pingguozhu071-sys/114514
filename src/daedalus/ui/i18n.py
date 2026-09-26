@@ -209,6 +209,21 @@ _TABLE: dict[str, dict[str, str]] = {
     "collect.no_engine": {"zh-CN": "引擎未启动：只能看，不能采。请从命令行启动界面（daedalus ui）。",
                           "ja-JP": "エンジン未起動：閲覧のみ。CLI から起動してください（daedalus ui）。",
                           "en-US": "Engine not running: view-only. Start the UI from the CLI (daedalus ui)."},
+    # 快速采集的「导入 TXT」——机主原话：「搞一个直接提取 txt 里面的链接…一行一个…
+    # 断掉的链接排除掉…小分类过滤…只适配 txt 就行」。计数口径：N=导入、M=无效排除、
+    # D=去重、K=域名数；三个数字都必须**如实**出现（宁可报 0 也不含糊）。
+    "collect.import_txt": {"zh-CN": "导入 TXT", "ja-JP": "TXT を読み込む", "en-US": "Import TXT"},
+    "collect.import_done": {"zh-CN": "导入 {n} 条（排除 {m} 条无效，去重 {d} 条），{k} 个域名",
+                            "ja-JP": "{n} 件を取り込み（無効 {m} 件を除外、重複 {d} 件を削除）、{k} ドメイン",
+                            "en-US": "Imported {n} ({m} invalid excluded, {d} duplicates), {k} domains"},
+    "collect.import_failed": {"zh-CN": "导入失败：{err}", "ja-JP": "読み込み失敗：{err}",
+                              "en-US": "Import failed: {err}"},
+    "collect.import_none": {"zh-CN": "「{name}」里没有找到可用链接",
+                            "ja-JP": "「{name}」に利用できるリンクが見つかりません",
+                            "en-US": "No usable links found in “{name}”"},
+    "dialog.pick_txt": {"zh-CN": "选择链接清单（TXT）", "ja-JP": "リンクリスト（TXT）を選ぶ",
+                        "en-US": "Choose link list (TXT)"},
+    "dialog.txt_filter": {"zh-CN": "文本文件", "ja-JP": "テキストファイル", "en-US": "Text files"},
     # 任务
     "tasks.hint": {"zh-CN": "任务下钻：每一行都能说清「看到了什么 → 决定了什么 → 为什么」",
                    "ja-JP": "タスク詳細：各行が「何を見て → 何を決め → なぜか」を説明できる",
