@@ -181,7 +181,12 @@ def build(*, dry: bool = False, exe_only: bool = False, skip_art: bool = False) 
                 print("   美术生成失败")
                 return rc
 
-    print("④ PyInstaller（one-dir；GUI + CLI 两个 EXE 共用一份依赖）")
+    print("④ 插件清单（构建期从源码树生成：冻结态运行时靠它枚举插件，pkgutil 扫不到 PYZ）")
+    manifest_lines = write_plugin_manifest()
+    for line in manifest_lines:
+        print(f"   · {line}")
+
+    print("⑤ PyInstaller（one-dir；GUI + CLI 两个 EXE 共用一份依赖）")
     _say("模块调用 PyInstaller.__main__.run", "packaging/daedalus.spec", "--noconfirm",
          "--distpath", DIST)
     if not dry:
@@ -196,9 +201,9 @@ def build(*, dry: bool = False, exe_only: bool = False, skip_art: bool = False) 
             return rc
 
     if exe_only:
-        print("⑤ 安装器：跳过（--exe-only）")
+        print("⑥ 安装器：跳过（--exe-only）")
     else:
-        print("⑤ NSIS 安装器（唯一的子进程：makensis.exe，字面量参数列表 + shell=False）")
+        print("⑥ NSIS 安装器（唯一的子进程：makensis.exe，字面量参数列表 + shell=False）")
         # 调 makensis **之前**的编码硬断言：三份许可文本必须都在且带 BOM（dry-run 也查——这是自证）。
         for line in assert_license_bom():
             print(f"   · 许可文本 {line}")
@@ -213,7 +218,7 @@ def build(*, dry: bool = False, exe_only: bool = False, skip_art: bool = False) 
                 print(f"   makensis 失败（退出码 {r.returncode}）——看上面的行号")
                 return int(r.returncode)
 
-    print("⑥ 产物核对")
+    print("⑦ 产物核对")
     if dry:
         print("   dry-run：跳过（没有任何产物被创建）")
         print("─" * 68)
@@ -222,9 +227,83 @@ def build(*, dry: bool = False, exe_only: bool = False, skip_art: bool = False) 
     rep = verify_package(expect_setup=not exe_only)
     for line in rep["lines"]:
         print("   " + line)
+    smoke_ok, smoke_lines = packaged_smoke()
+    for line in smoke_lines:
+        print("   " + line)
+    ok = rep["ok"] and smoke_ok
     print("─" * 68)
-    print("构建完成。" if rep["ok"] else "构建有问题（见上）。")
-    return 0 if rep["ok"] else 1
+    print("构建完成。" if ok else "构建有问题（见上）。")
+    return 0 if ok else 1
+
+
+def write_plugin_manifest() -> list[str]:
+    """构建期生成插件清单（`packaging/build_gen/plugin_manifest.json`）。
+
+    冻结态的 `pkgutil.iter_modules` 扫不到 PYZ 归档里的模块——运行时
+    `understand/registry.discover_specs` 靠这份清单**枚举**插件（真实事故 B20-2：
+    解析器注册表 4 → 1）。名单与 spec 的 `hiddenimports` 同源（都从源码树现算），
+    所以「加一个解析器 = 只加一个文件」在打包态依然成立。
+    """
+    out = PKG / "build_gen"
+    out.mkdir(parents=True, exist_ok=True)
+    manifest: dict[str, list[str]] = {}
+    lines: list[str] = []
+    for pkg_name, rel in (("daedalus.understand.parsers", "src/daedalus/understand/parsers"),
+                          ("daedalus.adapters.extractors", "src/daedalus/adapters/extractors")):
+        d = ROOT / rel
+        leaves = sorted(p.stem for p in d.glob("*.py") if p.name != "__init__.py")
+        manifest[pkg_name] = leaves
+        lines.append(f"{pkg_name}: {len(leaves)} 个（{'、'.join(leaves) or '空'}）")
+    mf = out / "plugin_manifest.json"
+    mf.write_text(json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8")
+    lines.append(f"清单已写 {mf.relative_to(ROOT)}")
+    return lines
+
+
+def packaged_smoke() -> tuple[bool, list[str]]:
+    """**打包态冒烟**：让冻结出来的 CLI 真驱动一次引擎（离线自证，不出网）。
+
+    为什么必须有：源码态门禁全部用桩（离线跑得快），「桩太多会漏真 bug」是台账
+    反复上演的教训——本轮就抓到两个只在冻结态暴露的问题（dry-run 出网 B20-1、
+    插件清单失效 B20-2）。三条硬判据：
+      1) `collect --dry-run` 退出码 0 且 stdout 自带 `"network_calls": 0`（离线自证）；
+      2) `reparse --dry-run` 退出码 0；
+      3) `doctor` 的 `parsers` 名单包含清单里的**全部**解析器（防"注册表 4 → 1"复发）。
+    """
+    lines: list[str] = []
+    ok = True
+    exe = DIST / "daedalus" / "daedalus-cli.exe"
+    if not exe.exists():
+        return False, ["打包态冒烟：找不到 " + str(exe)]
+
+    def _run(args: list[str]) -> tuple[int, str]:
+        # 字面量参数列表 + shell=False（安全策略硬要求；冻结 exe 不是 python 模块，只能子进程）
+        r = subprocess.run([str(exe), *args], cwd=str(ROOT), shell=False,
+                           capture_output=True, timeout=300)
+        return int(r.returncode), (r.stdout or "").decode("utf-8", errors="replace")
+
+    code, out = _run(["--json", "collect", "--dry-run", "https://example.com/"])
+    dry_ok = code == 0 and '"network_calls": 0' in out
+    ok = ok and dry_ok
+    lines.append(f"打包态冒烟 collect --dry-run：退出码 {code}｜network_calls=0 自证：{'过' if dry_ok else '✗ 未过'}")
+
+    code2, _ = _run(["--json", "reparse", "--dry-run"])
+    ok = ok and code2 == 0
+    lines.append(f"打包态冒烟 reparse --dry-run：退出码 {code2}｜{'过' if code2 == 0 else '✗ 未过'}")
+
+    code3, dout = _run(["--json", "doctor"])
+    try:
+        parser_names = {p.get("name") for p in json.loads(dout).get("parsers") or []}
+    except Exception:
+        parser_names = set()
+    # doctor 给的是解析器 **name**（不是模块名），与清单（模块名）口径不同——
+    # 所以这里核对**四件套成员**：artifact_meta 缺席就是 B20-2 复发（冻结态插件发现失效）。
+    want_names = {"html_text", "feed_sitemap", "json_text", "artifact_meta"}
+    parser_ok = code3 == 0 and want_names.issubset(parser_names)
+    ok = ok and parser_ok
+    lines.append(f"打包态冒烟 doctor：退出码 {code3}｜解析器 {sorted(parser_names) or '∅'}"
+                 f"｜四件套齐：{'过' if parser_ok else '✗ 未过（冻结态插件发现失效？）'}")
+    return ok, lines
 
 
 def verify_package(*, expect_setup: bool = True) -> dict:

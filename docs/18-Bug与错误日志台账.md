@@ -198,6 +198,20 @@
 | **B19-9** | 导出选中任务时 `task` 行全没了（JSONL 里只剩 ledger/artifact/page） | 任务行自带 `kind`（值 `acquire`），`{"kind":"task", **t}` 被它**覆盖**；而且我的 `except` 把异常吞了 → **静默失败** | 列改名 `kind AS task_kind`；**去掉吞异常的 except**（失败要看得见） | `s9_gate` 的 E1（`kinds` 里出现 `acquire` 而不是 `task`） | s9-E1 + s10-E12（导出必须含 task 行且已脱敏） |
 | **B19-10** | 任务页三个按钮**永远是灰的**（引擎起得比窗口晚时） | 可用状态在**建页时**定死 | `_sync_enabled()` 放进每秒轮询同步 + 处理器懒读 `ctx.engine`；概览页采集按钮同样处理 | `tools/ui_walk.py`（走查里注入桩引擎后按钮仍禁用 → 点了没反应） | 走查「任务页三操作」一项 + S10-E12 末尾「无引擎三按钮禁用」 |
 
+### B20 · 闭环流水线那一轮（打包态离线自证抓到的两个冻结态真 bug）
+
+这一轮的教训是老教训的新证据：**「真对象 + 真命令」才盖得住**。全部门禁都用桩（离线、快），
+源码态 291 项全绿；第一次让**打包出来的 exe 真驱动一次引擎**（`collect --dry-run`），
+两个只在冻结态/真引擎路径存在的问题当场现形。
+
+| 编号 | 现象 | 根因 | 修法 | 抓到的 | 防复发 |
+|---|---|---|---|---|---|
+| **B20-1** | 打包态 `collect --dry-run` 退出码 4，错误是自证断言「**dry-run 竟然出网了**」 | dry-run 的计划判定调了 `Fetcher.is_allowed(u)` → `RobotsCache.allowed()` → **现场抓 robots.txt**（一次真实 HTTP）→ 被 `network_calls==0` 的自证拦下。**源码态门禁全绿**：S9-C3 用的是桩引擎（桩的 is_allowed 不出网） | `Fetcher.is_allowed(url, *, fetch=True)` 新参数；`RobotsCache.allowed_cached()` **只用内存缓存**判定、绝不发请求；dry-run 用 `fetch=False`，robots 没缓存时**如实标「未判定（dry-run 不出网；真跑时会先取 robots）」**，不许装作判过 | 打包态冒烟第一次跑就炸；源码态复现同一退出码 4 | S1-B2b（真 RobotsCache + 计数 opener：`fetch=False` 缓存空→零出网+标未判定；缓存命中→按缓存判、依旧零出网）+ **build.py 打包态冒烟**（每次构建都真跑一遍） |
+| **B20-2** | 冻结态解析器注册表 **4 → 1**（stderr 日志「解析器注册表：1 个」）；`mediainfo` 之外三个解析器在打包产物里全失效 | 两层：① `pkgutil.iter_modules` 走文件系统，**扫不到 PyInstaller PYZ 归档里的模块**；② 注册表改成动态扫描后，解析器子模块失去了静态 import，**静态分析看不见就不进包**（旧版靠硬编码 import 顺带把它们带进去） | 双保险：① spec 里 `hiddenimports` **逐个点名**插件子模块（名单构建期从源码树现算，「加一个文件」在打包态不变）；② `tools/build.py` 生成**构建期插件清单** `plugin_manifest.json`，运行时冻结态扫描不足就用清单补齐（`_frozen_manifest_fullnames`），清单缺失按缺件报警 | 冻结态 stderr 的「注册表：1 个」+ 独立验收员在源码态直跑 `default_registry().summary()` 证明 4 个都在（对比出冻结态特有） | build.py 打包态冒烟第 3 条：`doctor` 的 `parsers` 名单必须**四件套齐**（html_text/feed_sitemap/json_text/artifact_meta），缺一个当场红 |
+
+**同一轮的工程事实**：流水线四名队员的交付（执行资源接线 / 插件面补真 / 路由表化 / TXT 导入+语言切换条）
+全部经全门禁（291 项）+ 走查（37 项）+ 独立验收（三件高风险亲自复现）背书；lint 软提示降到 278（低于 306 基线）。
+
 ---
 
 ## 四、怎么用这份文件

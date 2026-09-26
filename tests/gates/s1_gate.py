@@ -272,6 +272,50 @@ def t_robots_status():
     return ok("404/5xx/不可达/正常 四种都符合")
 
 
+@case("B2b dry-run 判定：is_allowed(fetch=False) **零出网**（缓存空也零请求，真实事故 B20-1）")
+def t_fetcher_dryrun_offline():
+    """真实事故（打包态冒烟抓到，台账 B20-1）：`collect --dry-run` 调 `is_allowed(u)`
+    → 现场抓 robots.txt → 被自证断言「dry-run 竟然出网了」拦下（退出码 4）。
+    源码态门禁全绿是因为桩的 is_allowed 不出网——「真对象+真缓存+计数 opener」才盖得住。
+    契约：`fetch=False` 时缓存命中按缓存判；**缓存空也一个请求都不发**，并如实标「未判定」。"""
+    from daedalus.net.fetch import Fetcher
+    from daedalus.net.robots import RobotsCache
+    calls = {"n": 0}
+
+    def opener(*a, **k):
+        calls["n"] += 1
+        return FakeResp(200)
+
+    class _CountingFetch:
+        """给 RobotsCache 用的取流桩：只负责让「真抓一次进缓存」可控、可计数。"""
+
+        def __init__(self, resp):
+            self.resp, self.n = resp, 0
+
+        def open(self, url, timeout=None):
+            self.n += 1
+            calls["n"] += 1
+            return self.resp
+
+    f = Fetcher(limiter=FakeLimiter(), robots=RobotsCache(fetcher=_CountingFetch(FakeResp(200))),
+                opener=opener, respect_robots=True)
+    # 缓存为空：不许出网（calls 必须停在 0），并如实标注「未判定」而不是装作判过
+    allowed, why = f.is_allowed("https://never-seen.example/x", fetch=False)
+    assert calls["n"] == 0, f"fetch=False 竟然发了 {calls['n']} 个请求（dry-run 出网事故复发）"
+    assert allowed is True and "未判定" in why, (allowed, why)
+    # 缓存命中：按缓存判，同样零出网（先真抓一次入缓存，再清零计数）
+    f2 = Fetcher(limiter=FakeLimiter(),
+                 robots=RobotsCache(fetcher=_CountingFetch(FakeResp(200, body=b"User-agent: *\nDisallow: /no\n"))),
+                 opener=opener, respect_robots=True)
+    f2.is_allowed("https://cached.example/no", fetch=True)   # 真抓一次，进缓存
+    assert calls["n"] >= 1
+    n_after_fill = calls["n"]
+    allowed2, why2 = f2.is_allowed("https://cached.example/no", fetch=False)
+    assert calls["n"] == n_after_fill, "fetch=False 在缓存命中时也发了请求"
+    assert allowed2 is False and "缓存判定" in why2, (allowed2, why2)
+    return ok("fetch=False：缓存空 → 零出网+如实标未判定；缓存命中 → 按缓存判、依旧零出网")
+
+
 @case("B3 robots 缓存：同域第二次不再取（24h TTL）")
 def t_robots_cache():
     from daedalus.net.robots import RobotsCache

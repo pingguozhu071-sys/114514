@@ -210,9 +210,13 @@ def cmd_collect(args) -> int:
     try:
         if args.dry_run:
             # **先自证是 dry-run**：不建任务、不出网，只做纯判定与计划展示
+            # `fetch=False`：robots **只用缓存判定**（没缓存就如实标「未判定」）。
+            # 真实事故（台账 B20-1）：这里曾直接调 `is_allowed(u)` → 现场抓 robots.txt
+            # → 被下面的自证断言「dry-run 竟然出网了」拦下。桩门禁测不出来（桩的
+            # is_allowed 不出网），打包态真引擎第一次跑就炸——「真对象+真命令」才盖得住。
             plan = []
             for u in targets:
-                allowed, why = app.fetcher.is_allowed(u)
+                allowed, why = app.fetcher.is_allowed(u, fetch=False)
                 plan.append({"url": u, "allowed": bool(allowed), "why": why,
                              "budget": (args.max_seconds and {"max_seconds": args.max_seconds}) or None,
                              "workers": args.workers})

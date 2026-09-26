@@ -144,16 +144,29 @@ class Fetcher:
         return resp
 
     # ── 只判定不取流（给调度/预览用）────────────────────────────────
-    def is_allowed(self, url: str) -> tuple[bool, str]:
-        """返回 (是否允许, 原因)。用于入队前拦截，避免把注定失败的 URL 排进前沿。"""
+    def is_allowed(self, url: str, *, fetch: bool = True) -> tuple[bool, str]:
+        """返回 (是否允许, 原因)。用于入队前拦截，避免把注定失败的 URL 排进前沿。
+
+        `fetch=False`：**只用缓存判定 robots，绝不发网络请求**（没缓存就如实标
+        「未判定」）——给 `collect --dry-run` 用（机主契约：dry-run 的 network_calls
+        必须实测为 0；真实事故见台账 B20-1）。真跑（缺省）仍走完整 robots 流程。
+        """
         u = str(url or "")
         if not u.startswith(("http://", "https://")):
             return False, "协议非法"
         from daedalus.net.ssrf_gate import is_private_url
         if is_private_url(u):
             return False, "SSRF 闸拦截（私网/保留地址）"
-        if self._respect_robots and self._robots is not None and not self._robots.allowed(u):
-            return False, "robots.txt 不允许"
+        if self._respect_robots and self._robots is not None:
+            if fetch:
+                if not self._robots.allowed(u):
+                    return False, "robots.txt 不允许"
+            else:
+                ok, known = self._robots.allowed_cached(u)
+                if known and not ok:
+                    return False, "robots.txt 不允许（缓存判定）"
+                if not known:
+                    return True, "robots 未缓存（dry-run 不出网，未判定；真跑时会先取 robots）"
         return True, "ok"
 
     def crawl_delay(self, url: str) -> float | None:
@@ -171,16 +184,3 @@ class Fetcher:
         return {"calls": self._calls, "respect_robots": self._respect_robots,
                 "limiter": self._limiter.stats() if self._limiter is not None else None,
                 "robots": self._robots.stats() if self._robots is not None else None}
-
-
-def build_fetcher(user_agent: str | None = None, per_domain_concurrency: int = 5,
-                  per_domain_qps: float = 1.0, respect_robots: bool = True,
-                  extra_headers: dict | None = None) -> Fetcher:
-    """按工程默认值组装一个咽喉（限速 + robots 缓存 + 闸）。"""
-    from daedalus.core.rate_limiter import DomainLimiter
-    limiter = DomainLimiter(per_domain_concurrency=per_domain_concurrency,
-                            per_domain_qps=per_domain_qps)
-    f = Fetcher(limiter=limiter, respect_robots=respect_robots,
-                user_agent=user_agent, extra_headers=extra_headers)
-    f._robots = RobotsCache(fetcher=f, user_agent="*")       # 打破循环：robots 用同一个咽喉取
-    return f

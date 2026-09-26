@@ -214,6 +214,32 @@ class RobotsCache:
         if not self.allowed(url):
             raise RobotsDenied(f"robots.txt 不允许: {str(url)[:120]}")
 
+    def allowed_cached(self, url: str) -> tuple[bool, bool]:
+        """**只用内存缓存**判定 robots，绝不发网络请求。返回 `(是否允许, 是否有缓存规则)`。
+
+        给 `collect --dry-run` 用（`cli.py` 的自证是「network_calls 实测为 0」）——
+        真实事故：dry-run 里调了 `Fetcher.is_allowed()` → 现场抓 robots.txt →
+        被自己的断言「dry-run 竟然出网了」拦下（台账 B20-1）。没有缓存规则时
+        返回 `(True, False)`：调用方（dry-run 的计划展示）必须**如实标注「未判定」**，
+        不许假装判过；真跑时仍会走完整的 robots 流程（含取流）。
+        """
+        try:
+            p = urllib.parse.urlparse(str(url or ""))
+            host = (p.hostname or "").lower()
+            if not host:
+                return False, True
+            now = time.monotonic()
+            with self._lock:
+                hit = self._cache.get(host)
+                if hit and (now - hit[1]) <= self._ttl:
+                    path = p.path or "/"
+                    if p.query:
+                        path = f"{path}?{p.query}"
+                    return hit[0].allows(path, self._ua), True
+        except Exception as e:                   # 缓存判定出错：按"没有缓存"处理，不伪装
+            logger.debug("robots 缓存判定失败（按未缓存处理）: %s", e)
+        return True, False
+
     def crawl_delay(self, url: str) -> float | None:
         """该域声明的 `Crawl-delay`（非标准，仅暴露给限速策略）。"""
         try:

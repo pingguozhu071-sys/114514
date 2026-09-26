@@ -65,3 +65,4 @@ perf_*.json
 bench_runs.jsonl
 soak_*.jsonl
 soak_report.json
+packaging/build_gen/

@@ -35,6 +35,22 @@ hiddenimports = [
     "daedalus.env.browser", "daedalus.understand.parsers.mediainfo",
 ]
 
+# 插件子模块必须**逐个点名**：注册表改成运行时动态扫描后，静态分析看不见它们——
+# 不点名就根本不进包（真实事故：冻结态解析器注册表 4 → 1，台账 B20-2）。
+# 名单从源码树现算，所以「加一个解析器 = 只加一个文件」在打包态依然成立。
+_pkg_dir = SRC / "daedalus" / "understand" / "parsers"
+_ext_dir = SRC / "daedalus" / "adapters" / "extractors"
+hiddenimports += [f"daedalus.understand.parsers.{p.stem}"
+                  for p in sorted(_pkg_dir.glob("*.py")) if p.name != "__init__.py"]
+hiddenimports += [f"daedalus.adapters.extractors.{p.stem}"
+                  for p in sorted(_ext_dir.glob("*.py")) if p.name != "__init__.py"]
+
+# 构建期插件清单（tools/build.py 生成）：冻结态运行时靠它**枚举**插件
+# （pkgutil 扫不到 PYZ）。没生成就不打进去（build.py 的打包态冒烟会当场抓住）。
+_build_gen = ROOT / "packaging" / "build_gen" / "plugin_manifest.json"
+if _build_gen.exists():
+    datas.append((str(_build_gen), "daedalus/understand"))
+
 # 明确排除（体积与启动时间）：这些被依赖间接带进来但用不到
 excludes = [
     "tkinter", "matplotlib", "pandas", "scipy", "IPython", "jupyter", "notebook",
